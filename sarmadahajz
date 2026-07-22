@@ -10,6 +10,7 @@ import winsound
 import shutil
 import socket
 import subprocess
+import base64
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QPushButton, QLineEdit, QLabel, QTextEdit, QGroupBox,
                              QFormLayout, QDialog, QMessageBox, QScrollArea, QGridLayout,
@@ -20,6 +21,7 @@ import undetected_chromedriver as uc
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from curl_cffi.requests import AsyncSession
+from Crypto.Cipher import AES
 
 if sys.platform == 'win32':
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
@@ -28,6 +30,7 @@ GLOBAL_BROWSER_LOCK = threading.Lock()
 GLOBAL_SOUND_LOCK = threading.Lock()
 FILE_LOCK = threading.Lock()
 DATA_FILE = "sarmada_data.json"
+SHAMCASH_MASTER_KEY = b"g0Zrgp8XRK/BN2ZAtUfJDQ=="  # مفتاح AES-192
 
 
 def load_all_data():
@@ -47,7 +50,7 @@ def save_all_data(data):
             with open(DATA_FILE, 'w', encoding='utf-8') as f:
                 json.dump(data, f, ensure_ascii=False, indent=4)
         except Exception as e:
-            print(f"[!] خطأ أثناء حفظ البيانات في الملف: {e}")
+            print(f"[!] خطأ حفظ: {e}")
 
 
 def get_chrome_main_version():
@@ -58,36 +61,29 @@ def get_chrome_main_version():
                 key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r'Software\Google\Chrome\BLBeacon')
                 version, _ = winreg.QueryValueEx(key, 'version')
                 return int(version.split('.')[0])
-            except Exception:
+            except:
                 pass
             try:
                 key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
-                                     r'SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\Google Chrome')
+                    r'SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\Google Chrome')
                 version, _ = winreg.QueryValueEx(key, 'version')
                 return int(version.split('.')[0])
-            except Exception:
+            except:
                 pass
-    except Exception:
+    except:
         pass
     return None
 
 
 def parse_proxy_string(proxy_str, proxy_type="http"):
-    """تحليل سلسلة البروكسي - خانة واحدة تدعم كل الأنواع"""
     proxy_str = proxy_str.strip()
     if not proxy_str:
         return None
-    # إذا يحتوي على بروتوكول مسبقاً
-    if proxy_str.startswith("http://") or proxy_str.startswith("https://"):
+    if proxy_str.startswith(("http://", "https://", "socks5://", "socks4://")):
         return proxy_str
-    elif proxy_str.startswith("socks5://") or proxy_str.startswith("socks4://"):
-        return proxy_str
-    else:
-        # صيغة user:pass@host:port أو host:port
-        if proxy_type == "socks5":
-            return f"socks5://{proxy_str}"
-        else:
-            return f"http://{proxy_str}"
+    if proxy_type == "socks5":
+        return f"socks5://{proxy_str}"
+    return f"http://{proxy_str}"
 
 
 def send_telegram_message(token, chat_id, text, retries=3):
@@ -100,14 +96,135 @@ def send_telegram_message(token, chat_id, text, retries=3):
     for attempt in range(retries):
         try:
             req = urllib.request.Request(url, data=data, headers=headers)
-            with urllib.request.urlopen(req, timeout=10) as response:
-                if response.status == 200:
-                    print(f"[+] تم إرسال رسالة التلجرام بنجاح.")
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                if resp.status == 200:
                     return
-        except Exception as e:
-            print(f"[!] خطأ في إرسال رسالة تلجرام (المحاولة {attempt + 1}/{retries}): {e}")
+        except:
             time.sleep(3)
-    print("[!] فشل إرسال رسالة التلجرام نهائياً.")
+
+
+
+# =============================================
+# نظام شام كاش - تشفير ودفع
+# =============================================
+def shamcash_get_session_key(forge_cookie):
+    """استخراج مفتاح الجلسة من كوكي forge"""
+    parts = forge_cookie.split('.')
+    encrypted_data = base64.b64decode(parts[0])
+    iv = base64.b64decode(parts[1])
+    tag = encrypted_data[-16:]
+    ciphertext = encrypted_data[:-16]
+    cipher = AES.new(SHAMCASH_MASTER_KEY, AES.MODE_GCM, nonce=iv)
+    cipher.update(b"")
+    return cipher.decrypt_and_verify(ciphertext, tag)
+
+
+def shamcash_encrypt_payload(payload_dict, auth_token, access_token, session_key):
+    """تشفير payload لشام كاش"""
+    # استخراج SessionId من JWT
+    jwt_payload = auth_token.split('.')[1]
+    jwt_payload += '=' * (4 - len(jwt_payload) % 4)
+    session_id = json.loads(base64.b64decode(jwt_payload).decode('utf-8'))['SessionId']
+
+    payload_dict['accessToken'] = access_token
+    payload_dict['SessionId'] = session_id
+
+    json_data = json.dumps(payload_dict, separators=(',', ':'))
+    iv = os.urandom(12)
+    cipher = AES.new(session_key, AES.MODE_GCM, nonce=iv)
+    cipher.update(b"")
+    ciphertext, tag = cipher.encrypt_and_digest(json_data.encode('utf-8'))
+    encrypted = ciphertext + tag
+    return base64.b64encode(encrypted).decode('utf-8') + "." + base64.b64encode(iv).decode('utf-8')
+
+
+class ShamcashPayWorker(QThread):
+    """خيط دفع شام كاش - بدون بروكسي مطلقاً"""
+    log_signal = pyqtSignal(str)
+    pay_result_signal = pyqtSignal(bool, str)  # success, message
+
+    def __init__(self, session_id, payment_code, shamcash_tokens):
+        super().__init__()
+        self.session_id = session_id
+        self.payment_code = payment_code
+        self.shamcash_tokens = shamcash_tokens  # dict with auth_token, access_token, forge_cookie
+
+    def run(self):
+        try:
+            auth_token = self.shamcash_tokens['auth_token']
+            access_token = self.shamcash_tokens['access_token']
+            forge_cookie = self.shamcash_tokens['forge_cookie']
+
+            session_key = shamcash_get_session_key(forge_cookie)
+
+            # 1. استعلام الفاتورة
+            self.log_signal.emit(f"🏦 [{self.session_id}] شام كاش: جاري الاستعلام عن {self.payment_code}...")
+            check_payload = {"values": [{"key": "process_number", "value": self.payment_code}]}
+            enc_data = shamcash_encrypt_payload(check_payload, auth_token, access_token, session_key)
+
+            headers = {
+                "accept": "application/json",
+                "content-type": "application/json",
+                "authorization": f"Bearer {auth_token}",
+                "e": "true",
+                "x-requested-with": "XMLHttpRequest",
+                "lang": "ar",
+                "origin": "https://shamcash.sy",
+                "referer": "https://shamcash.sy/ar/application/home",
+                "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            }
+
+            import requests
+            resp = requests.post(
+                "https://payment.shamcash.sy/v4/api/Billing/presentment?serviceId=37",
+                json={"encData": enc_data}, headers=headers, timeout=30
+            )
+            data = resp.json()
+
+            if not data.get("succeeded") or not data.get("data"):
+                msg = data.get("message", "فشل الاستعلام")
+                self.log_signal.emit(f"❌ [{self.session_id}] شام كاش استعلام فشل: {msg}")
+                self.pay_result_signal.emit(False, msg)
+                return
+
+            fields = data["data"][0]
+            process_no = next((item["value"] for item in fields if item["key"] == "process_no"), None)
+            due_amount = next((item["value"] for item in fields if item["key"] == "due_amount"), None)
+
+            if not process_no or not due_amount:
+                self.log_signal.emit(f"❌ [{self.session_id}] شام كاش: لم يُعثر على بيانات الدفع.")
+                self.pay_result_signal.emit(False, "لم يُعثر على بيانات")
+                return
+
+            self.log_signal.emit(
+                f"✅ [{self.session_id}] شام كاش: جاهز للدفع - المبلغ: {due_amount} ل.س")
+
+            # 2. تنفيذ الدفع
+            self.log_signal.emit(f"💳 [{self.session_id}] شام كاش: جاري الدفع...")
+            pay_payload = {"values": [
+                {"key": "process_no", "value": process_no},
+                {"key": "due_amount", "value": due_amount}
+            ]}
+            enc_pay = shamcash_encrypt_payload(pay_payload, auth_token, access_token, session_key)
+
+            pay_resp = requests.post(
+                "https://payment.shamcash.sy/v4/api/Billing/pay?serviceId=37",
+                json={"encData": enc_pay}, headers=headers, timeout=30
+            )
+            pay_data = pay_resp.json()
+
+            if pay_data.get("succeeded"):
+                self.log_signal.emit(
+                    f"🎉 [{self.session_id}] شام كاش: تم الدفع بنجاح! المبلغ: {due_amount}")
+                self.pay_result_signal.emit(True, f"تم الدفع {due_amount} ل.س")
+            else:
+                msg = pay_data.get("message", "فشل الدفع")
+                self.log_signal.emit(f"❌ [{self.session_id}] شام كاش دفع فشل: {msg}")
+                self.pay_result_signal.emit(False, msg)
+
+        except Exception as e:
+            self.log_signal.emit(f"❌ [{self.session_id}] خطأ شام كاش: {e}")
+            self.pay_result_signal.emit(False, str(e))
 
 
 
@@ -120,8 +237,7 @@ class LogWindow(QDialog):
         layout = QVBoxLayout(self)
         self.log_area = QTextEdit()
         self.log_area.setReadOnly(True)
-        self.log_area.setStyleSheet(
-            "background-color: #0d1117; color: #58a6ff; font-family: Consolas; font-size: 13px;")
+        self.log_area.setStyleSheet("background-color: #0d1117; color: #58a6ff; font-family: Consolas; font-size: 13px;")
         layout.addWidget(self.log_area)
         clear_btn = QPushButton("🧹 مسح السجلات")
         clear_btn.setStyleSheet("background-color: #21262d; color: white; padding: 5px;")
@@ -134,211 +250,100 @@ class LogWindow(QDialog):
 
 
 class HiddenSessionsDialog(QDialog):
-    def __init__(self, main_window, parent=None):
+    def __init__(self, mw, parent=None):
         super().__init__(parent)
-        self.main_window = main_window
-        self.setWindowTitle("تبويبة الجلسات المطفأة")
+        self.mw = mw
+        self.setWindowTitle("الجلسات المطفأة")
         self.resize(400, 300)
         self.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
-        self.setStyleSheet("""
-            QDialog { background-color: #0d1117; color: #c9d1d9; }
-            QLabel { font-weight: bold; font-size: 14px; }
-            QPushButton { background-color: #238636; color: white; border-radius: 4px; padding: 5px; }
-            QPushButton:hover { background-color: #2ea043; }
-        """)
+        self.setStyleSheet("QDialog{background:#0d1117;color:#c9d1d9;} QLabel{font-weight:bold;} QPushButton{background:#238636;color:white;border-radius:4px;padding:5px;}")
         self.layout = QVBoxLayout(self)
         self.populate()
 
     def populate(self):
         while self.layout.count():
             item = self.layout.takeAt(0)
-            w = item.widget()
-            if w:
-                w.deleteLater()
-            elif item.layout():
-                self._clear(item.layout())
-        hidden = [c for c in self.main_window.sessions if c.isHidden()]
+            if item.widget(): item.widget().deleteLater()
+        hidden = [c for c in self.mw.sessions if c.isHidden()]
         if not hidden:
-            lbl = QLabel("✅ لا توجد جلسات مطفأة حالياً.")
-            lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            self.layout.addWidget(lbl)
+            self.layout.addWidget(QLabel("✅ لا توجد جلسات مطفأة."))
             return
         for card in hidden:
             row = QHBoxLayout()
             row.addWidget(QLabel(f"جلسة: {card.session_id}"))
             row.addStretch()
-            btn = QPushButton("🔄 إعادة للواجهة")
-            btn.clicked.connect(lambda ch, c=card: self._restore(c))
+            btn = QPushButton("🔄 استعادة")
+            btn.clicked.connect(lambda ch, c=card: (c.show(), self.populate()))
             row.addWidget(btn)
             self.layout.addLayout(row)
-        self.layout.addStretch()
-
-    def _clear(self, layout):
-        if layout:
-            while layout.count():
-                item = layout.takeAt(0)
-                w = item.widget()
-                if w:
-                    w.deleteLater()
-                elif item.layout():
-                    self._clear(item.layout())
-
-    def _restore(self, card):
-        card.show()
-        self.main_window.print_log(f"[*] تم استعادة الجلسة {card.session_id}.")
-        self.populate()
-
 
 
 class GroupActionDialog(QDialog):
-    def __init__(self, main_window, parent=None):
+    def __init__(self, mw, parent=None):
         super().__init__(parent)
-        self.main_window = main_window
-        self.setWindowTitle("إدارة المجموعات (تحديد وإرسال)")
+        self.mw = mw
+        self.setWindowTitle("إدارة المجموعات")
         self.resize(850, 500)
         self.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
-        self.setStyleSheet("""
-            QDialog { background-color: #0d1117; color: #c9d1d9; }
-            QLabel { font-weight: bold; font-size: 13px; }
-            QCheckBox { spacing: 8px; color: #58a6ff; font-weight: bold; font-size: 14px;}
-            QCheckBox::indicator { width: 18px; height: 18px; }
-            QLineEdit { background-color: #21262d; border: 1px solid #30363d; color: #58a6ff; font-weight: bold; border-radius: 4px; padding: 4px;}
-            QPushButton { border-radius: 4px; padding: 6px; font-weight: bold; }
-        """)
-        self.rows_data = []
-        self.signal_connections = []
-        self.setup_ui()
+        self.setStyleSheet("QDialog{background:#0d1117;color:#c9d1d9;} QCheckBox{color:#58a6ff;font-weight:bold;} QPushButton{border-radius:4px;padding:6px;font-weight:bold;}")
+        self.rows = []
+        self.conns = []
+        self._build()
 
-    def setup_ui(self):
-        main_layout = QVBoxLayout(self)
-        top_bar = QHBoxLayout()
-        btn_sel = QPushButton("☑️ تحديد الكل")
-        btn_sel.setStyleSheet("background-color: #3b3b3b; color: white;")
-        btn_sel.clicked.connect(lambda: self._set_all(True))
-        btn_desel = QPushButton("☐ إلغاء التحديد")
-        btn_desel.setStyleSheet("background-color: #3b3b3b; color: white;")
-        btn_desel.clicked.connect(lambda: self._set_all(False))
-        top_bar.addWidget(btn_sel)
-        top_bar.addWidget(btn_desel)
-        top_bar.addStretch()
-        main_layout.addLayout(top_bar)
-
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setStyleSheet("QScrollArea { border: 1px solid #30363d; background-color: transparent; }")
-        container = QWidget()
-        self.list_layout = QVBoxLayout(container)
-        self.list_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
-
-        header = QHBoxLayout()
-        header.addWidget(QLabel("تحديد/الجلسة"), 2)
-        header.addWidget(QLabel("اللوحة"), 1)
-        header.addWidget(QLabel("التاريخ"), 1)
-        header.addWidget(QLabel("حالة"), 2)
-        header.addWidget(QLabel("رمز الدفع"), 2)
-        header.addWidget(QLabel(""), 1)
-        self.list_layout.addLayout(header)
-        line = QWidget()
-        line.setFixedHeight(1)
-        line.setStyleSheet("background-color: #30363d;")
-        self.list_layout.addWidget(line)
-
-        for card in [c for c in self.main_window.sessions if not c.isHidden()]:
+    def _build(self):
+        lay = QVBoxLayout(self)
+        top = QHBoxLayout()
+        b1 = QPushButton("☑️ الكل"); b1.clicked.connect(lambda: [r['chk'].setChecked(True) for r in self.rows])
+        b2 = QPushButton("☐ إلغاء"); b2.clicked.connect(lambda: [r['chk'].setChecked(False) for r in self.rows])
+        top.addWidget(b1); top.addWidget(b2); top.addStretch()
+        lay.addLayout(top)
+        scroll = QScrollArea(); scroll.setWidgetResizable(True)
+        cont = QWidget(); self.ll = QVBoxLayout(cont); self.ll.setAlignment(Qt.AlignmentFlag.AlignTop)
+        for card in [c for c in self.mw.sessions if not c.isHidden()]:
             row = QHBoxLayout()
-            chk = QCheckBox(f"{card.session_id}")
-            row.addWidget(chk, 2)
+            chk = QCheckBox(card.session_id); row.addWidget(chk, 2)
             row.addWidget(QLabel(card.inp_plate.text()), 1)
             row.addWidget(QLabel(card.inp_date.text()), 1)
-            lbl_st = QLabel(card.lbl_status.text())
-            lbl_st.setStyleSheet(card.lbl_status.styleSheet())
-            row.addWidget(lbl_st, 2)
-            c1 = card.status_changed.connect(lambda t, co, l=lbl_st: self._upd_st(l, t, co))
-            self.signal_connections.append((card.status_changed, c1))
-            inp = QLineEdit(card.inp_payment.text())
-            inp.setReadOnly(True)
-            inp.setPlaceholderText("بانتظار...")
-            row.addWidget(inp, 2)
-            c2 = card.payment_received.connect(lambda code, i=inp: i.setText(code))
-            self.signal_connections.append((card.payment_received, c2))
-            btn_cp = QPushButton("📋")
-            btn_cp.setStyleSheet("background-color: #21262d; color: white;")
-            btn_cp.clicked.connect(lambda ch, c=card, i=inp: self._copy(c, i.text()))
-            row.addWidget(btn_cp, 1)
-            self.list_layout.addLayout(row)
-            self.rows_data.append({'card': card, 'checkbox': chk})
-
-        scroll.setWidget(container)
-        main_layout.addWidget(scroll)
-
+            ls = QLabel(card.lbl_status.text()); row.addWidget(ls, 2)
+            inp = QLineEdit(card.inp_payment.text()); inp.setReadOnly(True); row.addWidget(inp, 2)
+            bp = QPushButton("📋"); bp.clicked.connect(lambda ch, i=inp: QApplication.clipboard().setText(i.text()) if i.text() else None)
+            row.addWidget(bp, 1)
+            self.ll.addLayout(row)
+            self.rows.append({'card': card, 'chk': chk})
+        scroll.setWidget(cont); lay.addWidget(scroll)
         acts = QHBoxLayout()
-        b1 = QPushButton("⚡ إرسال فردي (للمحدد)")
-        b1.setStyleSheet("background-color: #d29922; color: white;")
-        b1.clicked.connect(lambda: self._exec("single"))
-        b2 = QPushButton("🚀 قنص مستمر (للمحدد)")
-        b2.setStyleSheet("background-color: #1f6feb; color: white;")
-        b2.clicked.connect(lambda: self._exec("snipe"))
-        b3 = QPushButton("🛑 إيقاف (للمحدد)")
-        b3.setStyleSheet("background-color: #da3633; color: white;")
-        b3.clicked.connect(self._stop)
-        acts.addWidget(b1)
-        acts.addWidget(b2)
-        acts.addWidget(b3)
-        main_layout.addLayout(acts)
+        a1 = QPushButton("⚡ إرسال"); a1.setStyleSheet("background:#d29922;color:white;"); a1.clicked.connect(lambda: self._do("single"))
+        a2 = QPushButton("🚀 قنص"); a2.setStyleSheet("background:#1f6feb;color:white;"); a2.clicked.connect(lambda: self._do("snipe"))
+        a3 = QPushButton("🛑 إيقاف"); a3.setStyleSheet("background:#da3633;color:white;"); a3.clicked.connect(self._stp)
+        acts.addWidget(a1); acts.addWidget(a2); acts.addWidget(a3)
+        lay.addLayout(acts)
 
-    def _set_all(self, state):
-        for r in self.rows_data:
-            r['checkbox'].setChecked(state)
+    def _do(self, mode):
+        for r in self.rows:
+            if r['chk'].isChecked() and r['card'].xsrf_token:
+                r['card'].start_request(mode)
 
-    def _upd_st(self, label, text, color):
-        try:
-            label.setText(text)
-            label.setStyleSheet(f"color: {color}; font-weight: bold;")
-        except RuntimeError:
-            pass
+    def _stp(self):
+        for r in self.rows:
+            if r['chk'].isChecked(): r['card'].stop_request()
 
-    def _copy(self, card, code):
-        if code:
-            QApplication.clipboard().setText(code)
-            self.main_window.print_log(f"[+] [{card.session_id}] تم نسخ الكود: {code}")
-
-    def _exec(self, mode):
-        cnt = 0
-        for r in self.rows_data:
-            if r['checkbox'].isChecked():
-                if r['card'].xsrf_token:
-                    r['card'].start_request(mode)
-                    cnt += 1
-        if cnt:
-            self.main_window.print_log(f"[*] تم إطلاق ({mode}) لـ {cnt} جلسة.")
-        else:
-            QMessageBox.warning(self, "تنبيه", "لم يتم تحديد جلسة صالحة.")
-
-    def _stop(self):
-        for r in self.rows_data:
-            if r['checkbox'].isChecked():
-                r['card'].stop_request()
-
-    def closeEvent(self, event):
-        for sig, conn in self.signal_connections:
-            try:
-                sig.disconnect(conn)
-            except:
-                pass
-        super().closeEvent(event)
+    def closeEvent(self, ev):
+        for s, c in self.conns:
+            try: s.disconnect(c)
+            except: pass
+        super().closeEvent(ev)
 
 
 
 class RequestWorker(QThread):
-    """خيط واحد - يمكن إطلاق عدة نسخ بالتوازي"""
     log_signal = pyqtSignal(str)
-    success_signal = pyqtSignal(str, str, str, int)  # payment_code, fee, appointment_id, thread_id
+    success_signal = pyqtSignal(str, str, str, int)  # code, fee, appt_id, tid
     error_signal = pyqtSignal(str)
     finished_signal = pyqtSignal(int)
-    response_signal = pyqtSignal(int, int, str)  # thread_id, status_code, body
+    response_signal = pyqtSignal(int, int, str)
 
-    def __init__(self, session_id, payload, headers, cookies, mode="snipe",
-                 thread_id=0, proxy_url=None):
+    def __init__(self, session_id, payload, headers, cookies, mode="snipe", thread_id=0, proxy_url=None):
         super().__init__()
         self.session_id = session_id
         self.payload = payload
@@ -353,150 +358,90 @@ class RequestWorker(QThread):
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try:
-            loop.run_until_complete(self.execute_requests())
+            loop.run_until_complete(self._exec())
         except Exception as e:
             self.log_signal.emit(f"❌ [{self.session_id}][T{self.thread_id}] خطأ: {e}")
         finally:
-            try:
-                loop.close()
-            except:
-                pass
+            try: loop.close()
+            except: pass
             self.finished_signal.emit(self.thread_id)
 
-    def play_success_sound(self):
-        with GLOBAL_SOUND_LOCK:
-            try:
-                winsound.Beep(1000, 1500)
-            except:
-                pass
-
-    async def execute_requests(self):
-        try:
-            target_ip = socket.gethostbyname("api.mot.gov.sy")
-        except:
-            target_ip = "api.mot.gov.sy"
-
-        monitor_url = f"https://{target_ip}/api/provinces/804e7642-6798-4353-a556-f11d9aad2637/weeks/active"
-        post_url = f"https://{target_ip}/api/appointments/book"
-
+    async def _exec(self):
+        try: tip = socket.gethostbyname("api.mot.gov.sy")
+        except: tip = "api.mot.gov.sy"
+        mon_url = f"https://{tip}/api/provinces/804e7642-6798-4353-a556-f11d9aad2637/weeks/active"
+        post_url = f"https://{tip}/api/appointments/book"
         if self.proxy_url:
             self.log_signal.emit(f"🔗 [{self.session_id}][T{self.thread_id}] بروكسي: {self.proxy_url}")
-
-        async with AsyncSession(verify=False, proxy=self.proxy_url) as session:
-            attempts = 0
+        async with AsyncSession(verify=False, proxy=self.proxy_url) as s:
+            att = 0
             while self.is_running:
-                attempts += 1
-
+                att += 1
                 if self.mode == "snipe":
                     try:
-                        resp = await session.get(monitor_url, headers=self.headers,
-                                                 cookies=self.cookies, timeout=30)
-                        if resp.status_code == 200:
-                            state = resp.json().get("data", {}).get("registration", {}).get("state", "")
-                            if state != "open":
-                                if attempts % 3 == 1:
-                                    self.log_signal.emit(
-                                        f"⏳ [{self.session_id}][T{self.thread_id}] البوابة مغلقة...")
-                                await asyncio.sleep(1.5)
-                                continue
-                            else:
-                                if attempts % 3 == 1:
-                                    self.log_signal.emit(
-                                        f"🟢 [{self.session_id}][T{self.thread_id}] البوابة مفتوحة!")
+                        r = await s.get(mon_url, headers=self.headers, cookies=self.cookies, timeout=30)
+                        if r.status_code == 200:
+                            st = r.json().get("data",{}).get("registration",{}).get("state","")
+                            if st != "open":
+                                if att % 3 == 1: self.log_signal.emit(f"⏳ [{self.session_id}][T{self.thread_id}] مغلقة...")
+                                await asyncio.sleep(1.5); continue
                     except Exception as e:
-                        self.log_signal.emit(f"❌ [{self.session_id}][T{self.thread_id}] فشل المراقب: {e}")
-                        await asyncio.sleep(1)
-                        continue
-
+                        self.log_signal.emit(f"❌ [{self.session_id}][T{self.thread_id}] مراقب: {e}")
+                        await asyncio.sleep(1); continue
                 try:
-                    response = await session.post(post_url, json=self.payload,
-                                                  headers=self.headers, cookies=self.cookies, timeout=30)
-                    body = response.text[:200] if response.text else ""
-                    self.response_signal.emit(self.thread_id, response.status_code, body)
-
-                    if response.status_code in [200, 201]:
-                        data = response.json()
-                        code = data.get('data', {}).get('payment_code', 'غير متوفر')
-                        fee = str(data.get('data', {}).get('fee_amount', ''))
-                        appt_id = data.get('data', {}).get('appointment_id', '')
-                        self.log_signal.emit(
-                            f"🎉 [{self.session_id}][T{self.thread_id}] تم اصطياد الدور!")
-                        self.success_signal.emit(code, fee, appt_id, self.thread_id)
-                        threading.Thread(target=self.play_success_sound, daemon=True).start()
+                    resp = await s.post(post_url, json=self.payload, headers=self.headers, cookies=self.cookies, timeout=30)
+                    body = resp.text[:200] if resp.text else ""
+                    self.response_signal.emit(self.thread_id, resp.status_code, body)
+                    if resp.status_code in [200, 201]:
+                        d = resp.json()
+                        code = d.get('data',{}).get('payment_code','')
+                        fee = str(d.get('data',{}).get('fee_amount',''))
+                        aid = d.get('data',{}).get('appointment_id','')
+                        self.success_signal.emit(code, fee, aid, self.thread_id)
+                        with GLOBAL_SOUND_LOCK:
+                            try: winsound.Beep(1000, 1500)
+                            except: pass
                         break
-                    elif response.status_code == 422:
-                        self.log_signal.emit(
-                            f"⚠️ [{self.session_id}][T{self.thread_id}] 422: {body[:100]}")
-                        if self.mode == "single":
-                            break
-                    elif response.status_code in [401, 419]:
-                        self.log_signal.emit(
-                            f"❌ [{self.session_id}][T{self.thread_id}] الجلسة منتهية!")
-                        self.error_signal.emit("انتهت الجلسة.")
-                        break
-                    else:
-                        self.log_signal.emit(
-                            f"⚠️ [{self.session_id}][T{self.thread_id}] حالة: {response.status_code}")
+                    elif resp.status_code == 422:
+                        if self.mode == "single": break
+                    elif resp.status_code in [401, 419]:
+                        self.error_signal.emit("انتهت الجلسة."); break
                 except Exception as e:
-                    self.log_signal.emit(f"❌ [{self.session_id}][T{self.thread_id}] فشل: {e}")
-
-                if self.mode == "single":
-                    break
+                    self.log_signal.emit(f"❌ [{self.session_id}][T{self.thread_id}] {e}")
+                if self.mode == "single": break
                 await asyncio.sleep(0.3)
 
     def stop(self):
         self.is_running = False
 
 
-
 class PaymentStatusWorker(QThread):
-    """استعلام حالة رمز الدفع - يأخذ appointment_id مباشرة"""
     log_signal = pyqtSignal(str)
     result_signal = pyqtSignal(dict)
 
-    def __init__(self, session_id, appointment_id, headers, cookies, proxy_url=None):
+    def __init__(self, sid, appt_id, headers, cookies, proxy_url=None):
         super().__init__()
-        self.session_id = session_id
-        self.appointment_id = appointment_id
-        self.headers = headers
-        self.cookies = cookies
-        self.proxy_url = proxy_url
+        self.sid = sid; self.appt_id = appt_id; self.headers = headers
+        self.cookies = cookies; self.proxy_url = proxy_url
 
     def run(self):
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            loop.run_until_complete(self.check_status())
-        except Exception as e:
-            self.log_signal.emit(f"❌ [{self.session_id}] خطأ استعلام الدفع: {e}")
-        finally:
-            loop.close()
+        loop = asyncio.new_event_loop(); asyncio.set_event_loop(loop)
+        try: loop.run_until_complete(self._check())
+        except Exception as e: self.log_signal.emit(f"❌ [{self.sid}] {e}")
+        finally: loop.close()
 
-    async def check_status(self):
-        url = f"https://api.mot.gov.sy/api/appointments/{self.appointment_id}/payment-status"
-        headers = dict(self.headers)
-        headers["Accept"] = "application/json, text/plain, */*"
-        headers["Accept-Language"] = "ar"
-        if "Content-Type" in headers:
-            del headers["Content-Type"]
-
-        async with AsyncSession(verify=False, proxy=self.proxy_url) as session:
+    async def _check(self):
+        url = f"https://api.mot.gov.sy/api/appointments/{self.appt_id}/payment-status"
+        h = dict(self.headers); h["Accept"] = "application/json, text/plain, */*"; h["Accept-Language"] = "ar"
+        h.pop("Content-Type", None)
+        async with AsyncSession(verify=False, proxy=self.proxy_url) as s:
             try:
-                response = await session.get(url, headers=headers, cookies=self.cookies, timeout=30)
-                if response.status_code == 200:
-                    data = response.json()
-                    self.result_signal.emit(data)
-                    pd = data.get("data", {})
-                    self.log_signal.emit(
-                        f"💳 [{self.session_id}] حالة: {pd.get('payment_status','')} | "
-                        f"الرمز: {pd.get('payment_code','')} | "
-                        f"متبقي: {int(pd.get('payment_remaining_seconds',0))}ث")
+                r = await s.get(url, headers=h, cookies=self.cookies, timeout=30)
+                if r.status_code == 200:
+                    self.result_signal.emit(r.json())
                 else:
-                    self.log_signal.emit(
-                        f"⚠️ [{self.session_id}] فشل استعلام: {response.status_code}")
                     self.result_signal.emit({})
-            except Exception as e:
-                self.log_signal.emit(f"❌ [{self.session_id}] خطأ اتصال: {e}")
+            except:
                 self.result_signal.emit({})
 
 
@@ -509,12 +454,12 @@ class SessionCard(QGroupBox):
     _ui_renew_btn_signal = pyqtSignal(bool)
     _ui_status_signal = pyqtSignal(str, str)
 
-    def __init__(self, session_id, log_callback, rename_callback, delete_callback, parent=None):
+    def __init__(self, session_id, log_callback, rename_cb, delete_cb, parent=None):
         super().__init__(parent)
         self.session_id = session_id
         self.log_callback = log_callback
-        self.rename_callback = rename_callback
-        self.delete_callback = delete_callback
+        self.rename_callback = rename_cb
+        self.delete_callback = delete_cb
         self.driver = None
         self.driver_lock = threading.Lock()
         self.xsrf_token = ""
@@ -523,39 +468,41 @@ class SessionCard(QGroupBox):
         self.remember_token_value = ""
         self.user_agent = ""
         self.workers = []
-        self.last_appointment_id = ""  # يُحفظ تلقائياً من رد الحجز الناجح
+        self.last_appointment_id = ""
+        # شام كاش
+        self.shamcash_auth_token = ""
+        self.shamcash_access_token = ""
+        self.shamcash_forge_cookie = ""
 
         self._log_signal.connect(self.log_callback)
-        self._ui_browser_btn_signal.connect(self._update_browser_btn)
-        self._ui_renew_btn_signal.connect(self._update_renew_btn)
-        self._ui_status_signal.connect(self._update_status_ui)
+        self._ui_browser_btn_signal.connect(self._upd_br_btn)
+        self._ui_renew_btn_signal.connect(self._upd_ren_btn)
+        self._ui_status_signal.connect(self._upd_status_ui)
 
         self.setTitle(f"جلسة: {self.session_id}")
         self.setStyleSheet(
-            "QGroupBox { border: 2px solid #30363d; border-radius: 8px; margin-top: 10px; font-weight: bold;}"
-            " QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; color: #58a6ff;}")
+            "QGroupBox{border:2px solid #30363d;border-radius:8px;margin-top:10px;font-weight:bold;}"
+            " QGroupBox::title{subcontrol-origin:margin;left:10px;padding:0 5px;color:#58a6ff;}")
         self.setup_ui()
         self.load_session_data()
 
     def setup_ui(self):
         layout = QVBoxLayout(self)
 
-        # --- المتصفح ---
-        br_lay = QHBoxLayout()
+        # متصفح
+        br = QHBoxLayout()
         self.btn_browser = QPushButton("🌐 فتح المتصفح")
         self.btn_browser.clicked.connect(self.launch_browser)
-        self.btn_extract = QPushButton("🔄 سحب التوكن والتاريخ")
+        self.btn_extract = QPushButton("🔄 سحب التوكن")
         self.btn_extract.clicked.connect(self.extract_tokens)
-        self.btn_close_browser = QPushButton("❌ إغلاق المتصفح")
-        self.btn_close_browser.clicked.connect(self.close_browser)
-        self.btn_close_browser.setStyleSheet("color: #ff7b72;")
-        br_lay.addWidget(self.btn_browser)
-        br_lay.addWidget(self.btn_extract)
-        br_lay.addWidget(self.btn_close_browser)
-        layout.addLayout(br_lay)
+        self.btn_close_br = QPushButton("❌ إغلاق")
+        self.btn_close_br.clicked.connect(self.close_browser)
+        self.btn_close_br.setStyleSheet("color:#ff7b72;")
+        br.addWidget(self.btn_browser); br.addWidget(self.btn_extract); br.addWidget(self.btn_close_br)
+        layout.addLayout(br)
 
-        # --- البيانات ---
-        data_lay = QGridLayout()
+        # بيانات
+        dl = QGridLayout()
         self.inp_name = QLineEdit("محمد بكور زنجي")
         self.inp_plate = QLineEdit("5138855")
         self.inp_date = QLineEdit("2026-07-06")
@@ -566,179 +513,270 @@ class SessionCard(QGroupBox):
         self.cmb_transaction.addItem("حكم قضائي", "8f795e58-bbf0-4cb7-b1e8-cfc1b60038d6")
         self.cmb_transaction.addItem("تجديد ترخيص", "fd0df26f-9cf8-4f92-988a-83f09c70fcff")
         self.cmb_transaction.addItem("تسوية مقفل", "486ddf06-e59f-40e1-8408-a65a058e0003")
-        self.cmb_transaction.setStyleSheet(
-            "background-color: #21262d; border: 1px solid #30363d; color: #58a6ff;"
-            " font-weight: bold; border-radius: 4px; padding: 4px;")
-        data_lay.addWidget(QLabel("الاسم:"), 0, 0)
-        data_lay.addWidget(self.inp_name, 0, 1)
-        data_lay.addWidget(QLabel("اللوحة:"), 0, 2)
-        data_lay.addWidget(self.inp_plate, 0, 3)
-        data_lay.addWidget(QLabel("التاريخ:"), 1, 0)
-        data_lay.addWidget(self.inp_date, 1, 1)
-        data_lay.addWidget(QLabel("المعاملة:"), 1, 2)
-        data_lay.addWidget(self.cmb_transaction, 1, 3)
-        layout.addLayout(data_lay)
+        self.cmb_transaction.setStyleSheet("background:#21262d;border:1px solid #30363d;color:#58a6ff;font-weight:bold;border-radius:4px;padding:4px;")
+        dl.addWidget(QLabel("الاسم:"),0,0); dl.addWidget(self.inp_name,0,1)
+        dl.addWidget(QLabel("اللوحة:"),0,2); dl.addWidget(self.inp_plate,0,3)
+        dl.addWidget(QLabel("التاريخ:"),1,0); dl.addWidget(self.inp_date,1,1)
+        dl.addWidget(QLabel("المعاملة:"),1,2); dl.addWidget(self.cmb_transaction,1,3)
+        layout.addLayout(dl)
 
-        # --- البروكسي: خانة واحدة + مربع تحديد النوع ---
-        proxy_lay = QHBoxLayout()
-        self.chk_proxy_enabled = QCheckBox("تفعيل")
-        self.chk_proxy_enabled.setStyleSheet("color: #f0883e; font-weight: bold;")
-        proxy_lay.addWidget(self.chk_proxy_enabled)
+        # بروكسي
+        pl = QHBoxLayout()
+        self.chk_proxy = QCheckBox("تفعيل بروكسي"); self.chk_proxy.setStyleSheet("color:#f0883e;font-weight:bold;")
+        self.radio_http = QRadioButton("HTTP"); self.radio_http.setChecked(True); self.radio_http.setStyleSheet("color:#58a6ff;")
+        self.radio_socks = QRadioButton("SOCKS5"); self.radio_socks.setStyleSheet("color:#58a6ff;")
+        self.proxy_grp = QButtonGroup(self); self.proxy_grp.addButton(self.radio_http); self.proxy_grp.addButton(self.radio_socks)
+        self.inp_proxy = QLineEdit(); self.inp_proxy.setPlaceholderText("user:pass@host:port")
+        pl.addWidget(self.chk_proxy); pl.addWidget(self.radio_http); pl.addWidget(self.radio_socks); pl.addWidget(self.inp_proxy, 1)
+        layout.addLayout(pl)
 
-        self.radio_http = QRadioButton("HTTP")
-        self.radio_http.setChecked(True)
-        self.radio_http.setStyleSheet("color: #58a6ff;")
-        self.radio_socks = QRadioButton("SOCKS5")
-        self.radio_socks.setStyleSheet("color: #58a6ff;")
-        self.proxy_type_group = QButtonGroup(self)
-        self.proxy_type_group.addButton(self.radio_http)
-        self.proxy_type_group.addButton(self.radio_socks)
-        proxy_lay.addWidget(self.radio_http)
-        proxy_lay.addWidget(self.radio_socks)
+        # خيوط
+        tl = QHBoxLayout()
+        tl.addWidget(QLabel("خيوط:"))
+        self.spn_threads = QSpinBox(); self.spn_threads.setRange(1, 20); self.spn_threads.setValue(1)
+        self.spn_threads.setStyleSheet("background:#21262d;border:1px solid #30363d;color:#58a6ff;font-weight:bold;padding:3px;")
+        tl.addWidget(self.spn_threads); tl.addStretch()
+        layout.addLayout(tl)
 
-        self.inp_proxy = QLineEdit()
-        self.inp_proxy.setPlaceholderText("user:pass@host:port  (مثلاً smart-xxx:pass@proxy.smartproxy.net:3120)")
-        proxy_lay.addWidget(self.inp_proxy, 1)
-        layout.addLayout(proxy_lay)
+        # أدوات
+        tools = QHBoxLayout()
+        self.btn_fill = QPushButton("✍️ تعبئة"); self.btn_fill.clicked.connect(lambda: self.fill_browser(False))
+        self.btn_renew = QPushButton("♻️ تجديد"); self.btn_renew.setStyleSheet("background:#2ea043;color:white;"); self.btn_renew.clicked.connect(self.renew_session)
+        self.btn_save = QPushButton("💾 حفظ"); self.btn_save.setStyleSheet("background:#238636;color:white;"); self.btn_save.clicked.connect(self.save_session_data)
+        tools.addWidget(self.btn_fill); tools.addWidget(self.btn_renew); tools.addWidget(self.btn_save)
+        layout.addLayout(tools)
 
-        # --- عدد الخيوط ---
-        thr_lay = QHBoxLayout()
-        thr_lay.addWidget(QLabel("عدد الخيوط:"))
-        self.spn_threads = QSpinBox()
-        self.spn_threads.setMinimum(1)
-        self.spn_threads.setMaximum(20)
-        self.spn_threads.setValue(1)
-        self.spn_threads.setStyleSheet(
-            "background-color: #21262d; border: 1px solid #30363d; color: #58a6ff; font-weight: bold; padding: 3px;")
-        thr_lay.addWidget(self.spn_threads)
-        self.lbl_threads_info = QLabel("(كل ضغطة ترسل بعدد الخيوط)")
-        self.lbl_threads_info.setStyleSheet("color: #8b949e; font-size: 11px;")
-        thr_lay.addWidget(self.lbl_threads_info)
-        thr_lay.addStretch()
-        layout.addLayout(thr_lay)
+        # إجراءات
+        al = QHBoxLayout()
+        self.ds = "background:#d29922;color:white;font-weight:bold;"
+        self.as_ = "background:#9c7319;color:white;font-weight:bold;border:1px solid white;"
+        self.btn_single = QPushButton("⚡ إرسال"); self.btn_single.setStyleSheet(self.ds); self.btn_single.clicked.connect(lambda: self.start_request("single"))
+        self.dsnp = "background:#1f6feb;color:white;font-weight:bold;"
+        self.asnp = "background:#11428f;color:white;font-weight:bold;border:1px solid white;"
+        self.btn_snipe = QPushButton("🚀 قنص"); self.btn_snipe.setStyleSheet(self.dsnp); self.btn_snipe.clicked.connect(lambda: self.start_request("snipe"))
+        self.btn_stop = QPushButton("🛑 إيقاف"); self.btn_stop.setStyleSheet("background:#da3633;color:white;font-weight:bold;"); self.btn_stop.clicked.connect(self.stop_request); self.btn_stop.setEnabled(False)
+        al.addWidget(self.btn_single); al.addWidget(self.btn_snipe); al.addWidget(self.btn_stop)
+        layout.addLayout(al)
 
+        # نتائج
+        rl = QHBoxLayout()
+        self.lbl_status = QLabel("جاهز"); self.lbl_status.setStyleSheet("color:#8b949e;")
+        self.inp_payment = QLineEdit(); self.inp_payment.setPlaceholderText("رمز الدفع"); self.inp_payment.setReadOnly(True)
+        self.inp_payment.setStyleSheet("color:#58a6ff;font-weight:bold;font-size:14px;")
+        self.btn_copy = QPushButton("📋"); self.btn_copy.clicked.connect(self.copy_payment)
+        self.btn_check = QPushButton("🔍 استعلام"); self.btn_check.setStyleSheet("background:#6f42c1;color:white;font-weight:bold;"); self.btn_check.clicked.connect(self.check_payment_status)
+        rl.addWidget(self.lbl_status); rl.addStretch(); rl.addWidget(QLabel("الرمز:")); rl.addWidget(self.inp_payment)
+        rl.addWidget(self.btn_copy); rl.addWidget(self.btn_check)
+        layout.addLayout(rl)
 
-        # --- أدوات ---
-        tools_lay = QHBoxLayout()
-        self.btn_fill = QPushButton("✍️ تعبئة المتصفح")
-        self.btn_fill.clicked.connect(lambda: self.fill_browser(False))
-        self.btn_renew = QPushButton("♻️ تجديد (API)")
-        self.btn_renew.setStyleSheet("background-color: #2ea043; color: white;")
-        self.btn_renew.clicked.connect(self.renew_session)
-        self.btn_save_data = QPushButton("💾 حفظ البيانات")
-        self.btn_save_data.setStyleSheet("background-color: #238636; color: white;")
-        self.btn_save_data.clicked.connect(self.save_session_data)
-        tools_lay.addWidget(self.btn_fill)
-        tools_lay.addWidget(self.btn_renew)
-        tools_lay.addWidget(self.btn_save_data)
-        layout.addLayout(tools_lay)
+        self.lbl_threads = QLabel("خيوط: 0"); self.lbl_threads.setStyleSheet("color:#8b949e;font-size:11px;")
+        layout.addWidget(self.lbl_threads)
 
-        # --- إجراءات ---
-        act_lay = QHBoxLayout()
-        self.default_single_style = "background-color: #d29922; color: white; font-weight: bold;"
-        self.active_single_style = "background-color: #9c7319; color: white; font-weight: bold; border: 1px solid white;"
-        self.btn_single = QPushButton("⚡ إرسال مرة واحدة (API)")
-        self.btn_single.setStyleSheet(self.default_single_style)
-        self.btn_single.clicked.connect(lambda: self.start_request("single"))
-        self.default_snipe_style = "background-color: #1f6feb; color: white; font-weight: bold;"
-        self.active_snipe_style = "background-color: #11428f; color: white; font-weight: bold; border: 1px solid white;"
-        self.btn_snipe = QPushButton("🚀 بدء القنص (API)")
-        self.btn_snipe.setStyleSheet(self.default_snipe_style)
-        self.btn_snipe.clicked.connect(lambda: self.start_request("snipe"))
-        self.btn_stop = QPushButton("🛑 إيقاف")
-        self.btn_stop.setStyleSheet("background-color: #da3633; color: white; font-weight: bold;")
-        self.btn_stop.clicked.connect(self.stop_request)
-        self.btn_stop.setEnabled(False)
-        act_lay.addWidget(self.btn_single)
-        act_lay.addWidget(self.btn_snipe)
-        act_lay.addWidget(self.btn_stop)
-        layout.addLayout(act_lay)
+        # ===== تبويبة شام كاش =====
+        sc_grp = QGroupBox("🏦 شام كاش - الدفع المباشر")
+        sc_grp.setStyleSheet(
+            "QGroupBox{border:2px solid #10b981;border-radius:6px;margin-top:8px;padding-top:8px;}"
+            " QGroupBox::title{color:#10b981;font-size:12px;font-weight:bold;}")
+        sc_lay = QVBoxLayout(sc_grp)
 
-        # --- النتائج + نسخ الرمز + استعلام الدفع ---
-        res_lay = QHBoxLayout()
-        self.lbl_status = QLabel("الحالة: جاهز")
-        self.lbl_status.setStyleSheet("color: #8b949e;")
-        self.inp_payment = QLineEdit()
-        self.inp_payment.setPlaceholderText("رمز الدفع سيظهر هنا")
-        self.inp_payment.setReadOnly(True)
-        self.inp_payment.setStyleSheet("color: #58a6ff; font-weight: bold; font-size: 14px;")
-        self.btn_copy = QPushButton("📋 نسخ")
-        self.btn_copy.clicked.connect(self.copy_payment)
-        self.btn_check_payment = QPushButton("🔍 استعلام")
-        self.btn_check_payment.setStyleSheet("background-color: #6f42c1; color: white; font-weight: bold;")
-        self.btn_check_payment.clicked.connect(self.check_payment_status)
-        res_lay.addWidget(self.lbl_status)
-        res_lay.addStretch()
-        res_lay.addWidget(QLabel("الرمز:"))
-        res_lay.addWidget(self.inp_payment)
-        res_lay.addWidget(self.btn_copy)
-        res_lay.addWidget(self.btn_check_payment)
-        layout.addLayout(res_lay)
+        # صف أزرار شام كاش
+        sc_btns = QHBoxLayout()
+        self.btn_sc_open = QPushButton("🌐 فتح شام كاش")
+        self.btn_sc_open.setStyleSheet("background:#10b981;color:white;font-weight:bold;")
+        self.btn_sc_open.clicked.connect(self.shamcash_open_tab)
+        self.btn_sc_extract = QPushButton("🔑 سحب توكنات شام كاش")
+        self.btn_sc_extract.setStyleSheet("background:#0ea5e9;color:white;font-weight:bold;")
+        self.btn_sc_extract.clicked.connect(self.shamcash_extract_tokens)
+        self.btn_sc_pay = QPushButton("💳 دفع شام كاش الآن")
+        self.btn_sc_pay.setStyleSheet("background:#f59e0b;color:black;font-weight:bold;")
+        self.btn_sc_pay.clicked.connect(self.shamcash_pay_now)
+        sc_btns.addWidget(self.btn_sc_open); sc_btns.addWidget(self.btn_sc_extract); sc_btns.addWidget(self.btn_sc_pay)
+        sc_lay.addLayout(sc_btns)
 
-        # --- الخيوط النشطة ---
-        self.lbl_active_threads = QLabel("الخيوط النشطة: 0")
-        self.lbl_active_threads.setStyleSheet("color: #8b949e; font-size: 11px;")
-        layout.addWidget(self.lbl_active_threads)
+        # حالة شام كاش
+        self.lbl_sc_status = QLabel("🔴 غير مربوط")
+        self.lbl_sc_status.setStyleSheet("color:#da3633;font-weight:bold;")
+        # خيار دفع تلقائي
+        self.chk_auto_pay = QCheckBox("دفع تلقائي عند الحجز")
+        self.chk_auto_pay.setStyleSheet("color:#10b981;font-weight:bold;")
+        sc_status_lay = QHBoxLayout()
+        sc_status_lay.addWidget(self.lbl_sc_status); sc_status_lay.addStretch(); sc_status_lay.addWidget(self.chk_auto_pay)
+        sc_lay.addLayout(sc_status_lay)
 
-        # --- إدارة ---
-        mgmt_lay = QHBoxLayout()
-        self.btn_rename = QPushButton("✏️ إعادة تسمية")
-        self.btn_rename.setStyleSheet("background-color: #3b3b3b; color: white;")
-        self.btn_rename.clicked.connect(self.on_rename_clicked)
-        self.btn_hide = QPushButton("👁️ إطفاء")
-        self.btn_hide.setStyleSheet("background-color: #6e7681; color: white;")
-        self.btn_hide.clicked.connect(self.on_hide_clicked)
-        self.btn_delete = QPushButton("🗑️ حذف نهائي")
-        self.btn_delete.setStyleSheet("background-color: #8b0000; color: white;")
-        self.btn_delete.clicked.connect(self.on_delete_clicked)
-        mgmt_lay.addWidget(self.btn_rename)
-        mgmt_lay.addWidget(self.btn_hide)
-        mgmt_lay.addWidget(self.btn_delete)
-        layout.addLayout(mgmt_lay)
+        layout.addWidget(sc_grp)
+
+        # إدارة
+        ml = QHBoxLayout()
+        self.btn_rename = QPushButton("✏️ تسمية"); self.btn_rename.setStyleSheet("background:#3b3b3b;color:white;"); self.btn_rename.clicked.connect(self.on_rename)
+        self.btn_hide = QPushButton("👁️ إخفاء"); self.btn_hide.setStyleSheet("background:#6e7681;color:white;"); self.btn_hide.clicked.connect(lambda: (self.hide(), self.log(f"[*] [{self.session_id}] أُخفيت.")))
+        self.btn_del = QPushButton("🗑️ حذف"); self.btn_del.setStyleSheet("background:#8b0000;color:white;"); self.btn_del.clicked.connect(self.on_delete)
+        ml.addWidget(self.btn_rename); ml.addWidget(self.btn_hide); ml.addWidget(self.btn_del)
+        layout.addLayout(ml)
 
 
-    # ===== المنطق =====
+    # ===== شام كاش =====
+    def shamcash_open_tab(self):
+        """فتح تبويب شام كاش في نفس متصفح الجلسة"""
+        with self.driver_lock:
+            if not self.driver:
+                QMessageBox.warning(self, "تنبيه", "افتح المتصفح أولاً!")
+                return
+            try:
+                self.driver.execute_script("window.open('https://shamcash.sy/ar/application/home', '_blank');")
+                self.log(f"[+] [{self.session_id}] تم فتح تبويب شام كاش - سجّل دخولك ثم اسحب التوكنات.")
+            except Exception as e:
+                self.log(f"[!] [{self.session_id}] خطأ فتح شام كاش: {e}")
 
+    def shamcash_extract_tokens(self):
+        """سحب توكنات شام كاش من كوكيز المتصفح وحفظها"""
+        with self.driver_lock:
+            if not self.driver:
+                QMessageBox.warning(self, "خطأ", "افتح المتصفح أولاً!")
+                return
+            try:
+                # الانتقال لتبويب شام كاش إن وُجد
+                handles = self.driver.window_handles
+                shamcash_handle = None
+                for h in handles:
+                    self.driver.switch_to.window(h)
+                    if "shamcash" in self.driver.current_url:
+                        shamcash_handle = h
+                        break
+
+                if not shamcash_handle:
+                    self.log(f"[-] [{self.session_id}] لم يُعثر على تبويب شام كاش مفتوح.")
+                    # العودة لأول تبويب
+                    self.driver.switch_to.window(handles[0])
+                    return
+
+                # سحب الكوكيز
+                cookies = self.driver.get_cookies()
+                auth_token = ""
+                access_token = ""
+                forge_cookie = ""
+
+                for c in cookies:
+                    if c['name'] == 'authToken':
+                        auth_token = c['value']
+                    elif c['name'] == 'accessToken':
+                        access_token = c['value']
+                    elif c['name'] == 'forge':
+                        forge_cookie = c['value']
+
+                # العودة لتبويب دقيق
+                self.driver.switch_to.window(handles[0])
+
+                if auth_token and access_token and forge_cookie:
+                    self.shamcash_auth_token = auth_token
+                    self.shamcash_access_token = access_token
+                    self.shamcash_forge_cookie = forge_cookie
+                    self.lbl_sc_status.setText("🟢 مربوط وجاهز للدفع")
+                    self.lbl_sc_status.setStyleSheet("color:#10b981;font-weight:bold;")
+                    self._save_data_internal(False)
+                    self.log(f"[+] [{self.session_id}] ✅ تم سحب توكنات شام كاش بنجاح وحفظها!")
+                else:
+                    missing = []
+                    if not auth_token: missing.append("authToken")
+                    if not access_token: missing.append("accessToken")
+                    if not forge_cookie: missing.append("forge")
+                    self.log(f"[-] [{self.session_id}] شام كاش: ناقص: {', '.join(missing)}. هل سجلت الدخول؟")
+            except Exception as e:
+                self.log(f"[!] [{self.session_id}] خطأ سحب شام كاش: {e}")
+                # محاولة العودة لأول تبويب
+                try:
+                    self.driver.switch_to.window(self.driver.window_handles[0])
+                except:
+                    pass
+
+    def shamcash_pay_now(self):
+        """دفع يدوي عبر شام كاش لرمز الدفع الحالي"""
+        code = self.inp_payment.text().strip()
+        if not code:
+            QMessageBox.warning(self, "تنبيه", "لا يوجد رمز دفع! احجز أولاً.")
+            return
+        self._do_shamcash_pay(code)
+
+    def _do_shamcash_pay(self, payment_code):
+        """تنفيذ الدفع - بدون بروكسي"""
+        if not self.shamcash_auth_token or not self.shamcash_access_token or not self.shamcash_forge_cookie:
+            self.log(f"[-] [{self.session_id}] شام كاش غير مربوط! اسحب التوكنات أولاً.")
+            QMessageBox.warning(self, "شام كاش", "يجب سحب توكنات شام كاش أولاً!")
+            return
+
+        self.btn_sc_pay.setEnabled(False)
+        self.btn_sc_pay.setText("⏳ جاري الدفع...")
+
+        tokens = {
+            'auth_token': self.shamcash_auth_token,
+            'access_token': self.shamcash_access_token,
+            'forge_cookie': self.shamcash_forge_cookie
+        }
+        self._sc_worker = ShamcashPayWorker(self.session_id, payment_code, tokens)
+        self._sc_worker.log_signal.connect(self.log)
+        self._sc_worker.pay_result_signal.connect(self._on_sc_pay_result)
+        self._sc_worker.finished.connect(self._on_sc_pay_done)
+        self._sc_worker.start()
+
+    def _on_sc_pay_result(self, success, msg):
+        if success:
+            self.lbl_sc_status.setText(f"🟢 تم الدفع! {msg}")
+            self.lbl_sc_status.setStyleSheet("color:#10b981;font-weight:bold;")
+            # تلجرام
+            all_data = load_all_data()
+            tg = all_data.get("TELEGRAM_CONFIG", {})
+            if tg.get("token") and tg.get("chat_id"):
+                threading.Thread(target=send_telegram_message,
+                    args=(tg["token"], tg["chat_id"],
+                          f"💰 <b>تم الدفع عبر شام كاش!</b>\n🚗 {self.session_id}\n{msg}"),
+                    daemon=True).start()
+        else:
+            self.lbl_sc_status.setText(f"🔴 فشل: {msg[:40]}")
+            self.lbl_sc_status.setStyleSheet("color:#da3633;font-weight:bold;")
+
+    def _on_sc_pay_done(self):
+        self.btn_sc_pay.setEnabled(True)
+        self.btn_sc_pay.setText("💳 دفع شام كاش الآن")
+
+
+    # ===== المنطق الأساسي =====
     def get_proxy_url(self):
-        """خانة واحدة + مربع تحديد النوع"""
-        if not self.chk_proxy_enabled.isChecked():
-            return None
-        proxy_str = self.inp_proxy.text().strip()
-        if not proxy_str:
-            return None
-        ptype = "socks5" if self.radio_socks.isChecked() else "http"
-        return parse_proxy_string(proxy_str, ptype)
+        if not self.chk_proxy.isChecked(): return None
+        p = self.inp_proxy.text().strip()
+        if not p: return None
+        return parse_proxy_string(p, "socks5" if self.radio_socks.isChecked() else "http")
 
     def load_session_data(self):
         all_data = load_all_data()
         if self.session_id in all_data:
             d = all_data[self.session_id]
-            self.inp_name.setText(d.get("name", ""))
-            self.inp_plate.setText(d.get("plate", ""))
-            self.inp_date.setText(d.get("date", ""))
-            trans_id = d.get("transaction_id", "")
-            if trans_id:
-                idx = self.cmb_transaction.findData(trans_id)
-                if idx >= 0:
-                    self.cmb_transaction.setCurrentIndex(idx)
-            self.xsrf_token = d.get("xsrf_token", "")
-            self.accurate_session = d.get("accurate_session", "")
-            self.remember_token_name = d.get("remember_token_name", "")
-            self.remember_token_value = d.get("remember_token_value", "")
-            self.user_agent = d.get("user_agent", "")
-            self.last_appointment_id = d.get("last_appointment_id", "")
-            self.inp_proxy.setText(d.get("proxy", ""))
-            self.chk_proxy_enabled.setChecked(d.get("proxy_enabled", False))
-            if d.get("proxy_type", "http") == "socks5":
-                self.radio_socks.setChecked(True)
-            else:
-                self.radio_http.setChecked(True)
+            self.inp_name.setText(d.get("name",""))
+            self.inp_plate.setText(d.get("plate",""))
+            self.inp_date.setText(d.get("date",""))
+            tid = d.get("transaction_id","")
+            if tid:
+                idx = self.cmb_transaction.findData(tid)
+                if idx >= 0: self.cmb_transaction.setCurrentIndex(idx)
+            self.xsrf_token = d.get("xsrf_token","")
+            self.accurate_session = d.get("accurate_session","")
+            self.remember_token_name = d.get("remember_token_name","")
+            self.remember_token_value = d.get("remember_token_value","")
+            self.user_agent = d.get("user_agent","")
+            self.last_appointment_id = d.get("last_appointment_id","")
+            self.inp_proxy.setText(d.get("proxy",""))
+            self.chk_proxy.setChecked(d.get("proxy_enabled", False))
+            if d.get("proxy_type","http") == "socks5": self.radio_socks.setChecked(True)
+            else: self.radio_http.setChecked(True)
             self.spn_threads.setValue(d.get("thread_count", 1))
+            # شام كاش
+            self.shamcash_auth_token = d.get("shamcash_auth_token","")
+            self.shamcash_access_token = d.get("shamcash_access_token","")
+            self.shamcash_forge_cookie = d.get("shamcash_forge_cookie","")
+            self.chk_auto_pay.setChecked(d.get("shamcash_auto_pay", False))
+            if self.shamcash_auth_token and self.shamcash_forge_cookie:
+                self.lbl_sc_status.setText("🟢 مربوط (محفوظ)")
+                self.lbl_sc_status.setStyleSheet("color:#10b981;font-weight:bold;")
             if self.xsrf_token and self.accurate_session:
-                self.update_status("مستعد (توكن محفوظ) ✔️", "#238636")
-                self.log(f"[*] [{self.session_id}] تم استرجاع البيانات والتوكن.")
-            else:
-                self.log(f"[*] [{self.session_id}] تم استرجاع البيانات المحفوظة.")
+                self.update_status("مستعد ✔️", "#238636")
 
     def save_session_data(self):
         self._save_data_internal(True)
@@ -753,448 +791,232 @@ class SessionCard(QGroupBox):
             "remember_token_value": self.remember_token_value,
             "user_agent": self.user_agent, "last_appointment_id": self.last_appointment_id,
             "proxy": self.inp_proxy.text().strip(),
-            "proxy_enabled": self.chk_proxy_enabled.isChecked(),
+            "proxy_enabled": self.chk_proxy.isChecked(),
             "proxy_type": "socks5" if self.radio_socks.isChecked() else "http",
-            "thread_count": self.spn_threads.value()
+            "thread_count": self.spn_threads.value(),
+            "shamcash_auth_token": self.shamcash_auth_token,
+            "shamcash_access_token": self.shamcash_access_token,
+            "shamcash_forge_cookie": self.shamcash_forge_cookie,
+            "shamcash_auto_pay": self.chk_auto_pay.isChecked()
         }
         save_all_data(all_data)
-        self.log(f"[+] [{self.session_id}] تم الحفظ.")
-        if show_msg:
-            QMessageBox.information(self, "نجاح", "تم حفظ بيانات الجلسة.")
+        if show_msg: QMessageBox.information(self, "✅", "تم الحفظ.")
 
-    def log(self, msg):
-        self._log_signal.emit(msg)
-
-    def _update_browser_btn(self, text, en):
-        self.btn_browser.setText(text)
-        self.btn_browser.setEnabled(en)
-
-    def _update_renew_btn(self, en):
-        self.btn_renew.setEnabled(en)
-        if en:
-            self.btn_renew.setText("♻️ تجديد (API)")
-
-    def _update_status_ui(self, text, color):
-        self.lbl_status.setText(text)
-        self.lbl_status.setStyleSheet(f"color: {color};")
-        self.status_changed.emit(text, color)
-
-    def update_status(self, text, color="#8b949e"):
-        self._ui_status_signal.emit(text, color)
-
+    def log(self, msg): self._log_signal.emit(msg)
+    def _upd_br_btn(self, t, e): self.btn_browser.setText(t); self.btn_browser.setEnabled(e)
+    def _upd_ren_btn(self, e): self.btn_renew.setEnabled(e); self.btn_renew.setText("♻️ تجديد" if e else "⏳...")
+    def _upd_status_ui(self, t, c): self.lbl_status.setText(t); self.lbl_status.setStyleSheet(f"color:{c};"); self.status_changed.emit(t,c)
+    def update_status(self, t, c="#8b949e"): self._ui_status_signal.emit(t,c)
 
     def launch_browser(self):
-        self.btn_browser.setEnabled(False)
-        self.btn_browser.setText("⏳ جاري التحضير...")
+        self.btn_browser.setEnabled(False); self.btn_browser.setText("⏳...")
         threading.Thread(target=self._browser_thread, daemon=True).start()
 
     def _browser_thread(self):
         try:
-            profile_dir = os.path.join(os.getcwd(), "Profiles", f"Profile_{self.session_id}")
-            os.makedirs(profile_dir, exist_ok=True)
+            pdir = os.path.join(os.getcwd(), "Profiles", f"Profile_{self.session_id}")
+            os.makedirs(pdir, exist_ok=True)
             with GLOBAL_BROWSER_LOCK:
-                self.log(f"[*] [{self.session_id}] جاري تهيئة المتصفح...")
-                for attempt in range(3):
+                for att in range(3):
                     try:
                         if sys.platform == 'win32':
-                            try:
-                                safe_id = self.session_id.replace("'", "")
-                                subprocess.run(
-                                    f'wmic process where "name=\'chrome.exe\' and commandline like \'%Profile_{safe_id}%\'" call terminate',
-                                    shell=True, capture_output=True)
-                                time.sleep(0.5)
-                            except:
-                                pass
-                        for lk in ["SingletonLock", "SingletonCookie", "SingletonSocket"]:
-                            p = os.path.join(profile_dir, lk)
+                            try: subprocess.run(f'wmic process where "name=\'chrome.exe\' and commandline like \'%Profile_{self.session_id.replace(chr(39),"")}%\'" call terminate', shell=True, capture_output=True); time.sleep(0.5)
+                            except: pass
+                        for lk in ["SingletonLock","SingletonCookie","SingletonSocket"]:
+                            p = os.path.join(pdir, lk)
                             if os.path.exists(p):
-                                try:
-                                    os.remove(p)
-                                except:
-                                    pass
-                        options = uc.ChromeOptions()
-                        options.add_argument('--no-sandbox')
-                        options.add_argument('--disable-dev-shm-usage')
-                        options.add_argument('--disable-extensions')
-                        options.add_argument('--disable-gpu')
+                                try: os.remove(p)
+                                except: pass
+                        opts = uc.ChromeOptions()
+                        opts.add_argument('--no-sandbox'); opts.add_argument('--disable-dev-shm-usage'); opts.add_argument('--disable-gpu')
                         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                            s.bind(('127.0.0.1', 0))
-                            free_port = s.getsockname()[1]
-                        self.driver = uc.Chrome(user_data_dir=profile_dir, options=options,
-                                                use_subprocess=True, port=free_port,
-                                                version_main=get_chrome_main_version())
+                            s.bind(('127.0.0.1',0)); fp = s.getsockname()[1]
+                        self.driver = uc.Chrome(user_data_dir=pdir, options=opts, use_subprocess=True, port=fp, version_main=get_chrome_main_version())
                         break
                     except Exception as e:
-                        if attempt < 2:
-                            self.log(f"[*] [{self.session_id}] فشل ({attempt+1}): {str(e)[:60]}")
-                            time.sleep(2)
-                        else:
-                            raise e
-
+                        if att < 2: time.sleep(2)
+                        else: raise e
             time.sleep(1.5)
-            inject_js = r"""
-            window.sarmadaSelectedDate = '';
-            const origOpen = XMLHttpRequest.prototype.open;
-            XMLHttpRequest.prototype.open = function(method, url) {
-                if (typeof url === 'string' && url.includes('date=')) {
-                    let m = url.match(/date=(20\d{2}-\d{2}-\d{2})/);
-                    if (m) window.sarmadaSelectedDate = m[1];
-                }
-                return origOpen.apply(this, arguments);
-            };
-            const origFetch = window.fetch;
-            window.fetch = async function() {
-                let url = arguments[0] instanceof Request ? arguments[0].url : arguments[0];
-                if (typeof url === 'string' && url.includes('date=')) {
-                    let m = url.match(/date=(20\d{2}-\d{2}-\d{2})/);
-                    if (m) window.sarmadaSelectedDate = m[1];
-                }
-                return origFetch.apply(this, arguments);
-            };
-            """
+            js = r"""window.sarmadaSelectedDate='';const o=XMLHttpRequest.prototype.open;XMLHttpRequest.prototype.open=function(m,u){if(typeof u==='string'&&u.includes('date=')){let x=u.match(/date=(20\d{2}-\d{2}-\d{2})/);if(x)window.sarmadaSelectedDate=x[1];}return o.apply(this,arguments);};const f=window.fetch;window.fetch=async function(){let u=arguments[0] instanceof Request?arguments[0].url:arguments[0];if(typeof u==='string'&&u.includes('date=')){let x=u.match(/date=(20\d{2}-\d{2}-\d{2})/);if(x)window.sarmadaSelectedDate=x[1];}return f.apply(this,arguments);};"""
             with self.driver_lock:
                 if self.driver:
-                    self.driver.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument', {'source': inject_js})
+                    self.driver.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument',{'source':js})
                     self.driver.set_page_load_timeout(45)
                     self.driver.get("https://accurate.mot.gov.sy/reviewer/availability")
             self.log(f"[+] [{self.session_id}] تم فتح المتصفح.")
-            self._ui_browser_btn_signal.emit("🌐 المتصفح مفتوح", False)
-            self.update_status("المتصفح قيد التشغيل", "#e3b341")
+            self._ui_browser_btn_signal.emit("🌐 مفتوح", False)
+            self.update_status("المتصفح يعمل", "#e3b341")
         except Exception as e:
-            self.log(f"[!] [{self.session_id}] خطأ المتصفح: {e}")
-            self._ui_browser_btn_signal.emit("🌐 فتح المتصفح", True)
+            self.log(f"[!] [{self.session_id}] خطأ: {e}")
+            self._ui_browser_btn_signal.emit("🌐 فتح", True)
 
     def extract_tokens(self):
         with self.driver_lock:
-            if not self.driver:
-                QMessageBox.warning(self, "خطأ", "افتح المتصفح أولاً!")
-                return
+            if not self.driver: QMessageBox.warning(self,"خطأ","افتح المتصفح!"); return
             try:
                 self.user_agent = self.driver.execute_script("return navigator.userAgent;")
-                page_date = self.driver.execute_script("""
-                    if (window.sarmadaSelectedDate) return window.sarmadaSelectedDate;
-                    let m = document.body.innerText.match(/20\\d{2}-\\d{2}-\\d{2}/);
-                    return m ? m[0] : '';
-                """)
-                if page_date:
-                    self.inp_date.setText(page_date)
-                    self.log(f"[*] [{self.session_id}] تاريخ: {page_date}")
-                cookies = self.driver.get_cookies()
-                for c in cookies:
-                    if c['name'] == 'XSRF-TOKEN':
-                        self.xsrf_token = urllib.parse.unquote(c['value'])
-                    elif c['name'] == 'accurate_session':
-                        self.accurate_session = c['value']
-                    elif c['name'].startswith('remember_web_'):
-                        self.remember_token_name = c['name']
-                        self.remember_token_value = c['value']
+                pd = self.driver.execute_script("if(window.sarmadaSelectedDate)return window.sarmadaSelectedDate;let m=document.body.innerText.match(/20\\d{2}-\\d{2}-\\d{2}/);return m?m[0]:'';")
+                if pd: self.inp_date.setText(pd)
+                for c in self.driver.get_cookies():
+                    if c['name']=='XSRF-TOKEN': self.xsrf_token=urllib.parse.unquote(c['value'])
+                    elif c['name']=='accurate_session': self.accurate_session=c['value']
+                    elif c['name'].startswith('remember_web_'): self.remember_token_name=c['name']; self.remember_token_value=c['value']
                 if self.xsrf_token and self.accurate_session:
-                    self.log(f"[+] [{self.session_id}] تم سحب الجلسة بنجاح.")
-                    self.update_status("مستعد ✔️", "#238636")
-                    self._save_data_internal(False)
-                else:
-                    self.log(f"[-] [{self.session_id}] لم أجد التوكن.")
-            except Exception as e:
-                self.log(f"[!] [{self.session_id}] خطأ: {e}")
+                    self.log(f"[+] [{self.session_id}] تم سحب التوكن ✔️"); self.update_status("مستعد ✔️","#238636"); self._save_data_internal(False)
+                else: self.log(f"[-] [{self.session_id}] لم يُعثر على التوكن.")
+            except Exception as e: self.log(f"[!] [{self.session_id}] {e}")
 
     def close_browser(self):
         with self.driver_lock:
             if self.driver:
-                try:
-                    self.driver.quit()
-                except:
-                    pass
-                finally:
-                    self.driver = None
-                    self._ui_browser_btn_signal.emit("🌐 فتح المتصفح", True)
-                    self.update_status("المتصفح مغلق", "#8b949e")
-
+                try: self.driver.quit()
+                except: pass
+                finally: self.driver=None; self._ui_browser_btn_signal.emit("🌐 فتح",True); self.update_status("مغلق","#8b949e")
 
     def fill_browser(self, auto_submit=False):
         with self.driver_lock:
-            if not self.driver:
-                if not auto_submit:
-                    QMessageBox.warning(self, "خطأ", "افتح المتصفح أولاً!")
-                return
-        threading.Thread(target=self._selenium_fill, args=(auto_submit,), daemon=True).start()
+            if not self.driver: return
+        threading.Thread(target=self._fill, args=(auto_submit,), daemon=True).start()
 
-    def _selenium_fill(self, auto_submit):
+    def _fill(self, auto):
         try:
-            name, plate = self.inp_name.text(), self.inp_plate.text()
+            n, p = self.inp_name.text(), self.inp_plate.text()
             with self.driver_lock:
-                if not self.driver:
-                    return
-                inputs = self.driver.find_elements(By.TAG_NAME, 'input')
-            vis = [i for i in inputs if i.is_displayed() and i.is_enabled()
-                   and i.get_attribute('type') in ['text', 'number', 'tel', '']]
-            if len(vis) >= 2:
+                if not self.driver: return
+                inps = self.driver.find_elements(By.TAG_NAME,'input')
+            vis = [i for i in inps if i.is_displayed() and i.is_enabled() and i.get_attribute('type') in ['text','number','tel','']]
+            if len(vis)>=2:
                 with self.driver_lock:
-                    if not self.driver:
-                        return
-                    for i, val in enumerate([name, plate]):
-                        vis[i].send_keys(Keys.CONTROL + "a")
-                        vis[i].send_keys(Keys.DELETE)
-                        time.sleep(0.1)
-                        vis[i].send_keys(val)
-                        time.sleep(0.1)
-                self.log(f"[+] [{self.session_id}] تم تعبئة البيانات.")
-                if auto_submit:
+                    for i,v in enumerate([n,p]):
+                        vis[i].send_keys(Keys.CONTROL+"a"); vis[i].send_keys(Keys.DELETE); time.sleep(0.1); vis[i].send_keys(v); time.sleep(0.1)
+                if auto:
                     time.sleep(0.5)
                     with self.driver_lock:
-                        if not self.driver:
-                            return
-                        for btn in self.driver.find_elements(By.TAG_NAME, 'button'):
-                            if btn.is_displayed() and ("حجز" in btn.text or "تأكيد" in btn.text):
-                                btn.click()
-                                self.log(f"[+] [{self.session_id}] ضغط زر الحجز.")
-                                break
-        except Exception as e:
-            self.log(f"[!] [{self.session_id}] خطأ تعبئة: {e}")
+                        if not self.driver: return
+                        for b in self.driver.find_elements(By.TAG_NAME,'button'):
+                            if b.is_displayed() and ("حجز" in b.text or "تأكيد" in b.text): b.click(); break
+        except Exception as e: self.log(f"[!] {e}")
 
     def renew_session(self):
-        if not self.xsrf_token:
-            QMessageBox.warning(self, "تنبيه", "لا يوجد توكن.")
-            return
-        self.btn_renew.setEnabled(False)
-        self.btn_renew.setText("⏳ تجديد...")
-        threading.Thread(target=self._renew_thread, daemon=True).start()
+        if not self.xsrf_token: return
+        self.btn_renew.setEnabled(False); self.btn_renew.setText("⏳...")
+        threading.Thread(target=self._renew, daemon=True).start()
 
-    def _renew_thread(self):
+    def _renew(self):
         try:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            ok = loop.run_until_complete(self._async_renew())
-            loop.close()
-            if ok:
-                self.log(f"[+] [{self.session_id}] تم التجديد ♻️.")
-                self.update_status("مستعد (تجديد) ✔️", "#2ea043")
-            else:
-                self.log(f"[-] [{self.session_id}] فشل التجديد.")
-        except Exception as e:
-            self.log(f"[!] [{self.session_id}] خطأ تجديد: {e}")
-        finally:
-            self._ui_renew_btn_signal.emit(True)
+            loop = asyncio.new_event_loop(); asyncio.set_event_loop(loop)
+            ok = loop.run_until_complete(self._arenew()); loop.close()
+            if ok: self.update_status("مستعد (تجديد) ✔️","#2ea043")
+        except: pass
+        finally: self._ui_renew_btn_signal.emit(True)
 
-    async def _async_renew(self):
-        cookies = {"XSRF-TOKEN": self.xsrf_token, "accurate_session": self.accurate_session}
-        if self.remember_token_name:
-            cookies[self.remember_token_name] = self.remember_token_value
-        headers = {
-            "User-Agent": self.user_agent or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/147.0.0.0",
-            "Accept": "text/html,*/*;q=0.8",
-        }
-        proxy_url = self.get_proxy_url()
-        async with AsyncSession(verify=False, proxy=proxy_url) as session:
-            resp = await session.get("https://accurate.mot.gov.sy/", cookies=cookies,
-                                     headers=headers, impersonate="chrome110", timeout=20)
-            if resp.status_code == 200:
-                new_x = session.cookies.get("XSRF-TOKEN")
-                new_s = session.cookies.get("accurate_session")
-                if new_x:
-                    self.xsrf_token = urllib.parse.unquote(new_x)
-                if new_s:
-                    self.accurate_session = new_s
-                self._save_data_internal(False)
-                return True
+    async def _arenew(self):
+        ck = {"XSRF-TOKEN":self.xsrf_token,"accurate_session":self.accurate_session}
+        if self.remember_token_name: ck[self.remember_token_name]=self.remember_token_value
+        h = {"User-Agent":self.user_agent or "Mozilla/5.0","Accept":"text/html,*/*;q=0.8"}
+        async with AsyncSession(verify=False, proxy=self.get_proxy_url()) as s:
+            r = await s.get("https://accurate.mot.gov.sy/",cookies=ck,headers=h,impersonate="chrome110",timeout=20)
+            if r.status_code==200:
+                nx=s.cookies.get("XSRF-TOKEN"); ns=s.cookies.get("accurate_session")
+                if nx: self.xsrf_token=urllib.parse.unquote(nx)
+                if ns: self.accurate_session=ns
+                self._save_data_internal(False); return True
             return False
 
 
     def start_request(self, mode):
-        """إطلاق خيوط متعددة - كل ضغطة تضيف خيوط جديدة"""
-        if not self.xsrf_token:
-            QMessageBox.warning(self, "تنبيه", "سحب التوكن أولاً!")
-            return
-        date_val = self.inp_date.text().strip()
-        if not date_val:
-            QMessageBox.warning(self, "تنبيه", "حدد التاريخ!")
-            return
+        if not self.xsrf_token: return
+        dv = self.inp_date.text().strip()
+        if not dv: return
+        payload = {"province_id":"804e7642-6798-4353-a556-f11d9aad2637","name":self.inp_name.text().strip(),"plate_number":self.inp_plate.text().strip(),"date":dv,"transaction_type_ids":[self.cmb_transaction.currentData()]}
+        headers = {"Host":"api.mot.gov.sy","Accept":"application/json, text/plain, */*","Content-Type":"application/json","X-Requested-With":"XMLHttpRequest","Origin":"https://accurate.mot.gov.sy","Referer":"https://accurate.mot.gov.sy/","X-Xsrf-Token":self.xsrf_token,"User-Agent":self.user_agent or "Mozilla/5.0 Chrome/147.0.0.0"}
+        cookies = {"XSRF-TOKEN":self.xsrf_token,"accurate_session":self.accurate_session}
+        pu = self.get_proxy_url(); tc = self.spn_threads.value()
+        self.btn_stop.setEnabled(True); self.inp_payment.clear()
+        if mode=="single": self.btn_single.setStyleSheet(self.as_); self.update_status(f"إرسال ({tc})...","#e3b341")
+        else: self.btn_snipe.setStyleSheet(self.asnp); self.update_status(f"قنص ({tc})...","#e3b341")
+        bid = len(self.workers)
+        for i in range(tc):
+            w = RequestWorker(self.session_id, payload, headers, cookies, mode, bid+i, pu)
+            w.log_signal.connect(self.log); w.success_signal.connect(self.on_success)
+            w.error_signal.connect(self.on_error); w.finished_signal.connect(self.on_tfin)
+            w.response_signal.connect(self.on_resp)
+            self.workers.append(w); w.start()
+        self._upd_thr()
 
-        payload = {
-            "province_id": "804e7642-6798-4353-a556-f11d9aad2637",
-            "name": self.inp_name.text().strip(),
-            "plate_number": self.inp_plate.text().strip(),
-            "date": date_val,
-            "transaction_type_ids": [self.cmb_transaction.currentData()]
-        }
-        headers = {
-            "Host": "api.mot.gov.sy",
-            "Accept": "application/json, text/plain, */*",
-            "Content-Type": "application/json",
-            "X-Requested-With": "XMLHttpRequest",
-            "Origin": "https://accurate.mot.gov.sy",
-            "Referer": "https://accurate.mot.gov.sy/",
-            "X-Xsrf-Token": self.xsrf_token,
-            "User-Agent": self.user_agent or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/147.0.0.0 Safari/537.36"
-        }
-        cookies = {"XSRF-TOKEN": self.xsrf_token, "accurate_session": self.accurate_session}
-        proxy_url = self.get_proxy_url()
-        thread_count = self.spn_threads.value()
+    def _upd_thr(self):
+        a = sum(1 for w in self.workers if w.isRunning())
+        self.lbl_threads.setText(f"خيوط: {a}/{len(self.workers)}")
 
-        self.btn_stop.setEnabled(True)
-        self.inp_payment.clear()
-        if mode == "single":
-            self.btn_single.setText(f"⏳ ({thread_count})...")
-            self.btn_single.setStyleSheet(self.active_single_style)
-            self.update_status(f"إرسال ({thread_count} خيط)...", "#e3b341")
-        else:
-            self.btn_snipe.setText(f"⏳ ({thread_count})...")
-            self.btn_snipe.setStyleSheet(self.active_snipe_style)
-            self.update_status(f"قنص ({thread_count} خيط)...", "#e3b341")
+    def on_resp(self, tid, code, body):
+        c = "🟢" if code in [200,201] else "🟡" if code==422 else "🔴"
+        self.log(f"{c} [{self.session_id}][T{tid}] {code} | {body[:60]}")
 
-        base_id = len(self.workers)
-        for i in range(thread_count):
-            tid = base_id + i
-            w = RequestWorker(self.session_id, payload, headers, cookies, mode,
-                              thread_id=tid, proxy_url=proxy_url)
-            w.log_signal.connect(self.log)
-            w.success_signal.connect(self.on_success)
-            w.error_signal.connect(self.on_error)
-            w.finished_signal.connect(self.on_thread_finished)
-            w.response_signal.connect(self.on_response_received)
-            self.workers.append(w)
-            w.start()
-        self._update_threads_label()
-        self.log(f"[*] [{self.session_id}] أُطلق {thread_count} خيط (المجموع: {len(self.workers)})")
+    def on_tfin(self, tid):
+        self._upd_thr()
+        if not any(w.isRunning() for w in self.workers): self._all_done()
 
-    def _update_threads_label(self):
-        active = sum(1 for w in self.workers if w.isRunning())
-        self.lbl_active_threads.setText(f"الخيوط النشطة: {active} / {len(self.workers)}")
-
-    def on_response_received(self, tid, code, body):
-        c = "🟢" if code in [200, 201] else "🟡" if code == 422 else "🔴"
-        self.log(f"{c} [{self.session_id}][T{tid}] رد: {code} | {body[:80]}")
-
-    def on_thread_finished(self, tid):
-        self._update_threads_label()
-        if not any(w.isRunning() for w in self.workers):
-            self._on_all_done()
-
-    def _on_all_done(self):
+    def _all_done(self):
         self.workers.clear()
-        self.btn_single.setEnabled(True)
-        self.btn_snipe.setEnabled(True)
-        self.btn_stop.setEnabled(False)
-        self.btn_single.setText("⚡ إرسال مرة واحدة (API)")
-        self.btn_single.setStyleSheet(self.default_single_style)
-        self.btn_snipe.setText("🚀 بدء القنص (API)")
-        self.btn_snipe.setStyleSheet(self.default_snipe_style)
-        self._update_threads_label()
-        if "تم الحجز" not in self.lbl_status.text() and "توقف" not in self.lbl_status.text():
-            self.update_status("مستعد", "#8b949e")
+        self.btn_single.setEnabled(True); self.btn_snipe.setEnabled(True); self.btn_stop.setEnabled(False)
+        self.btn_single.setText("⚡ إرسال"); self.btn_single.setStyleSheet(self.ds)
+        self.btn_snipe.setText("🚀 قنص"); self.btn_snipe.setStyleSheet(self.dsnp)
+        self._upd_thr()
+        if "تم" not in self.lbl_status.text() and "توقف" not in self.lbl_status.text():
+            self.update_status("مستعد","#8b949e")
 
     def stop_request(self):
-        for w in self.workers:
-            w.stop()
-        self.update_status("تم الإيقاف", "#da3633")
+        for w in self.workers: w.stop()
+        self.update_status("تم الإيقاف","#da3633")
 
     def on_success(self, code, fee, appt_id, tid):
         self.inp_payment.setText(code)
-        self.last_appointment_id = appt_id  # حفظ تلقائي للاستعلام المباشر
-        self.update_status(f"✅ تم الحجز ({fee})", "#238636")
+        self.last_appointment_id = appt_id
+        self.update_status(f"✅ تم الحجز ({fee})","#238636")
         self.payment_received.emit(code)
-        self.log(f"[$$$] [{self.session_id}][T{tid}] الرمز: {code} | الرسوم: {fee} | ID: {appt_id}")
-        for w in self.workers:
-            w.stop()
+        self.log(f"[$$$] [{self.session_id}][T{tid}] الرمز: {code} | {fee} | {appt_id}")
+        for w in self.workers: w.stop()
         self._save_data_internal(False)
         # تلجرام
-        all_data = load_all_data()
-        tg = all_data.get("TELEGRAM_CONFIG", {})
+        all_data = load_all_data(); tg = all_data.get("TELEGRAM_CONFIG",{})
         if tg.get("token") and tg.get("chat_id"):
-            msg = (f"✅ <b>تم الحجز!</b>\n🚗 {self.session_id}\n👤 {self.inp_name.text()}\n"
-                   f"🔢 {self.inp_plate.text()}\n📅 {self.inp_date.text()}\n"
-                   f"💰 {fee} ل.س\n💳 <code>{code}</code>\n⏳ دقيقتان للتسديد!")
-            threading.Thread(target=send_telegram_message,
-                           args=(tg["token"], tg["chat_id"], msg), daemon=True).start()
+            threading.Thread(target=send_telegram_message, args=(tg["token"],tg["chat_id"],
+                f"✅ <b>حجز!</b> {self.session_id}\n💳 <code>{code}</code>\n💰 {fee}"), daemon=True).start()
+        # === دفع تلقائي شام كاش ===
+        if self.chk_auto_pay.isChecked() and code:
+            self.log(f"🏦 [{self.session_id}] بدء الدفع التلقائي عبر شام كاش...")
+            self._do_shamcash_pay(code)
 
-    def on_error(self, err):
-        self.update_status("توقف (راجع السجل)", "#da3633")
-
+    def on_error(self, err): self.update_status("توقف","#da3633")
 
     def check_payment_status(self):
-        """استعلام مباشر - يأخذ appointment_id من رد الحجز تلقائياً"""
-        if not self.xsrf_token:
-            QMessageBox.warning(self, "تنبيه", "سحب التوكن أولاً!")
-            return
-        if not self.last_appointment_id:
-            QMessageBox.warning(self, "تنبيه",
-                "لا يوجد معرف حجز محفوظ!\nقم بالحجز أولاً أو أدخل المعرف يدوياً.")
-            # إتاحة الإدخال اليدوي كخيار أخير
-            appt_id, ok = QInputDialog.getText(self, "معرف الحجز",
-                "أدخل appointment_id:", text="")
-            if not ok or not appt_id.strip():
-                return
-            self.last_appointment_id = appt_id.strip()
-            self._save_data_internal(False)
+        if not self.xsrf_token or not self.last_appointment_id: return
+        h = {"Host":"api.mot.gov.sy","Accept":"application/json, text/plain, */*","X-Requested-With":"XMLHttpRequest","Origin":"https://accurate.mot.gov.sy","Referer":"https://accurate.mot.gov.sy/","X-Xsrf-Token":self.xsrf_token,"Accept-Language":"ar","User-Agent":self.user_agent or "Mozilla/5.0"}
+        ck = {"XSRF-TOKEN":self.xsrf_token,"accurate_session":self.accurate_session}
+        if self.remember_token_name: ck[self.remember_token_name]=self.remember_token_value
+        self.btn_check.setEnabled(False)
+        self._pw = PaymentStatusWorker(self.session_id, self.last_appointment_id, h, ck, self.get_proxy_url())
+        self._pw.log_signal.connect(self.log); self._pw.result_signal.connect(self._pmt_res); self._pw.finished.connect(lambda: self.btn_check.setEnabled(True))
+        self._pw.start()
 
-        headers = {
-            "Host": "api.mot.gov.sy",
-            "Accept": "application/json, text/plain, */*",
-            "X-Requested-With": "XMLHttpRequest",
-            "Origin": "https://accurate.mot.gov.sy",
-            "Referer": "https://accurate.mot.gov.sy/",
-            "X-Xsrf-Token": self.xsrf_token,
-            "Accept-Language": "ar",
-            "User-Agent": self.user_agent or "Mozilla/5.0 Chrome/147.0.0.0"
-        }
-        cookies = {"XSRF-TOKEN": self.xsrf_token, "accurate_session": self.accurate_session}
-        if self.remember_token_name:
-            cookies[self.remember_token_name] = self.remember_token_value
-
-        self.btn_check_payment.setEnabled(False)
-        self.btn_check_payment.setText("⏳...")
-        self._pmt_worker = PaymentStatusWorker(
-            self.session_id, self.last_appointment_id, headers, cookies, self.get_proxy_url())
-        self._pmt_worker.log_signal.connect(self.log)
-        self._pmt_worker.result_signal.connect(self._on_pmt_result)
-        self._pmt_worker.finished.connect(self._on_pmt_done)
-        self._pmt_worker.start()
-
-    def _on_pmt_result(self, data):
-        if not data:
-            return
-        pd = data.get("data", {})
-        status = pd.get("payment_status", "")
-        code = pd.get("payment_code", "")
-        remaining = pd.get("payment_remaining_seconds", 0)
-        fee = pd.get("fee_amount", "")
-        slot = pd.get("slot_no", "")
-        target = pd.get("target_date", "")
-        start = pd.get("start_at", "")
-        if code and not self.inp_payment.text():
-            self.inp_payment.setText(code)
-        st_map = {"pending": "قيد الانتظار ⏳", "paid": "مدفوع ✅", "expired": "منتهي ❌"}
-        QMessageBox.information(self, "استعلام الدفع",
-            f"📊 الحالة: {st_map.get(status, status)}\n"
-            f"💳 الرمز: {code}\n💰 المبلغ: {fee} ل.س\n"
-            f"📅 التاريخ: {target}\n🔢 الدور: {slot}\n"
-            f"⏰ الموعد: {start}\n⏳ متبقي: {int(remaining)}ث")
-
-    def _on_pmt_done(self):
-        self.btn_check_payment.setEnabled(True)
-        self.btn_check_payment.setText("🔍 استعلام")
+    def _pmt_res(self, data):
+        if not data: return
+        pd = data.get("data",{})
+        st = {"pending":"قيد الانتظار ⏳","paid":"مدفوع ✅","expired":"منتهي ❌"}.get(pd.get("payment_status",""), pd.get("payment_status",""))
+        QMessageBox.information(self,"دفع", f"الحالة: {st}\nالرمز: {pd.get('payment_code','')}\nالمبلغ: {pd.get('fee_amount','')} ل.س\nمتبقي: {int(pd.get('payment_remaining_seconds',0))}ث")
 
     def copy_payment(self):
-        code = self.inp_payment.text()
-        if code:
-            QApplication.clipboard().setText(code)
-            self.log(f"[+] [{self.session_id}] نُسخ: {code}")
+        c = self.inp_payment.text()
+        if c: QApplication.clipboard().setText(c)
 
-    def on_rename_clicked(self):
+    def on_rename(self):
         with self.driver_lock:
-            if self.driver:
-                QMessageBox.warning(self, "تنبيه", "أغلق المتصفح أولاً.")
-                return
-        new_name, ok = QInputDialog.getText(self, "تسمية", "الاسم الجديد:", text=self.session_id)
-        if ok and new_name and new_name != self.session_id:
-            self.rename_callback(self, self.session_id, new_name.strip())
+            if self.driver: QMessageBox.warning(self,"!","أغلق المتصفح."); return
+        n, ok = QInputDialog.getText(self,"تسمية","الاسم:",text=self.session_id)
+        if ok and n and n != self.session_id: self.rename_callback(self, self.session_id, n.strip())
 
-    def on_hide_clicked(self):
-        self.hide()
-        self.log(f"[*] [{self.session_id}] تم الإخفاء.")
-
-    def on_delete_clicked(self):
-        if QMessageBox.question(self, 'حذف', f"حذف '{self.session_id}' نهائياً؟",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No) == QMessageBox.StandardButton.Yes:
+    def on_delete(self):
+        if QMessageBox.question(self,'حذف',f"حذف '{self.session_id}'؟",QMessageBox.StandardButton.Yes|QMessageBox.StandardButton.No)==QMessageBox.StandardButton.Yes:
             self.delete_callback(self)
 
 
@@ -1204,214 +1026,106 @@ class SarmadaPro(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Alghanem Office - Sarmada V17 (Multi-Thread + Proxy + Payment Check)")
-        self.resize(1100, 850)
+        self.setWindowTitle("Alghanem - Sarmada V18 (Threads + Proxy + ShamCash)")
+        self.resize(1100, 900)
         self.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
-        self.setStyleSheet("""
-            QMainWindow { background-color: #0d1117; color: #c9d1d9; }
-            QWidget { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
-            QLabel { color: #c9d1d9; }
-            QLineEdit { background-color: #21262d; border: 1px solid #30363d; color: #c9d1d9; padding: 5px; border-radius: 4px; }
-            QPushButton { background-color: #21262d; border: 1px solid #30363d; color: #c9d1d9; padding: 6px; border-radius: 4px; }
-            QPushButton:hover { background-color: #30363d; }
-            QPushButton:disabled { background-color: #161b22; color: #484f58; border: 1px solid #21262d; }
-        """)
+        self.setStyleSheet("""QMainWindow{background:#0d1117;color:#c9d1d9;} QWidget{font-family:'Segoe UI',Tahoma;} QLabel{color:#c9d1d9;} QLineEdit{background:#21262d;border:1px solid #30363d;color:#c9d1d9;padding:5px;border-radius:4px;} QPushButton{background:#21262d;border:1px solid #30363d;color:#c9d1d9;padding:6px;border-radius:4px;} QPushButton:hover{background:#30363d;} QPushButton:disabled{background:#161b22;color:#484f58;}""")
         self.log_window = LogWindow(self)
         self.sessions = []
-        self.log_signal.connect(self._safe_log)
+        self.log_signal.connect(self._slog)
         self.session_counter = 0
-        self.setup_ui(load_all_data())
+        self._build(load_all_data())
 
-    def setup_ui(self, saved_data):
-        central = QWidget()
-        self.setCentralWidget(central)
-        main_lay = QVBoxLayout(central)
-
+    def _build(self, sd):
+        cw = QWidget(); self.setCentralWidget(cw); ml = QVBoxLayout(cw)
         # تلجرام
-        tg_grp = QGroupBox("إعدادات التلجرام (اختياري)")
-        tg_lay = QHBoxLayout()
-        self.inp_tg_token = QLineEdit()
-        self.inp_tg_token.setPlaceholderText("Bot Token")
-        self.inp_tg_token.setEchoMode(QLineEdit.EchoMode.PasswordEchoOnEdit)
-        self.inp_tg_chat_id = QLineEdit()
-        self.inp_tg_chat_id.setPlaceholderText("Chat ID")
-        tg_cfg = saved_data.get("TELEGRAM_CONFIG", {})
-        self.inp_tg_token.setText(tg_cfg.get("token", ""))
-        self.inp_tg_chat_id.setText(tg_cfg.get("chat_id", ""))
-        btn_tg = QPushButton("💾 حفظ واختبار")
-        btn_tg.setStyleSheet("background-color: #1f6feb; color: white;")
-        btn_tg.clicked.connect(self.save_test_tg)
-        tg_lay.addWidget(QLabel("توكن:"))
-        tg_lay.addWidget(self.inp_tg_token)
-        tg_lay.addWidget(QLabel("Chat ID:"))
-        tg_lay.addWidget(self.inp_tg_chat_id)
-        tg_lay.addWidget(btn_tg)
-        tg_grp.setLayout(tg_lay)
-        main_lay.addWidget(tg_grp)
-
-        # شريط علوي
+        tg = QGroupBox("إعدادات التلجرام"); tl = QHBoxLayout()
+        self.inp_tt = QLineEdit(); self.inp_tt.setPlaceholderText("Bot Token"); self.inp_tt.setEchoMode(QLineEdit.EchoMode.PasswordEchoOnEdit)
+        self.inp_tc = QLineEdit(); self.inp_tc.setPlaceholderText("Chat ID")
+        tc = sd.get("TELEGRAM_CONFIG",{}); self.inp_tt.setText(tc.get("token","")); self.inp_tc.setText(tc.get("chat_id",""))
+        bt = QPushButton("💾 حفظ"); bt.setStyleSheet("background:#1f6feb;color:white;"); bt.clicked.connect(self._save_tg)
+        tl.addWidget(QLabel("توكن:")); tl.addWidget(self.inp_tt); tl.addWidget(QLabel("ID:")); tl.addWidget(self.inp_tc); tl.addWidget(bt)
+        tg.setLayout(tl); ml.addWidget(tg)
+        # شريط
         top = QHBoxLayout()
-        btn_add = QPushButton("➕ إضافة جلسة")
-        btn_add.setStyleSheet("background-color: #238636; color: white; font-weight: bold;")
-        btn_add.clicked.connect(self.add_session)
-        btn_grp = QPushButton("👥 المجموعات")
-        btn_grp.setStyleSheet("background-color: #d29922; color: white; font-weight: bold;")
-        btn_grp.clicked.connect(self.open_groups)
-        btn_ren = QPushButton("♻️ تجديد الكل")
-        btn_ren.setStyleSheet("background-color: #2ea043; color: white; font-weight: bold;")
-        btn_ren.clicked.connect(self.renew_all)
-        btn_fill = QPushButton("✨ تعبئة وحجز للكل")
-        btn_fill.setStyleSheet("background-color: #8e44ad; color: white; font-weight: bold;")
-        btn_fill.clicked.connect(self.fill_all)
-        btn_s = QPushButton("⚡ إرسال للكل")
-        btn_s.clicked.connect(lambda: self.trigger_all("single"))
-        btn_sn = QPushButton("🚀 قنص للكل")
-        btn_sn.setStyleSheet("border-color: #1f6feb;")
-        btn_sn.clicked.connect(lambda: self.trigger_all("snipe"))
-        btn_st = QPushButton("🛑 إيقاف الكل")
-        btn_st.setStyleSheet("border-color: #da3633;")
-        btn_st.clicked.connect(self.stop_all)
-        btn_hid = QPushButton("👁️ المطفأة")
-        btn_hid.setStyleSheet("background-color: #6e7681; color: white;")
-        btn_hid.clicked.connect(self.show_hidden)
-        btn_log = QPushButton("📋 السجلات")
-        btn_log.clicked.connect(self.log_window.show)
-        for b in [btn_add, btn_grp, btn_ren, btn_fill, btn_s, btn_sn, btn_st, btn_hid, btn_log]:
-            top.addWidget(b)
-        main_lay.addLayout(top)
-
+        for txt, sty, fn in [("➕ جلسة","background:#238636;color:white;font-weight:bold;",self.add_session),
+            ("👥 مجموعات","background:#d29922;color:white;font-weight:bold;",self.open_groups),
+            ("♻️ تجديد الكل","background:#2ea043;color:white;font-weight:bold;",self.renew_all),
+            ("✨ تعبئة للكل","background:#8e44ad;color:white;font-weight:bold;",self.fill_all),
+            ("⚡ إرسال","",lambda: self.trigger_all("single")),
+            ("🚀 قنص","border-color:#1f6feb;",lambda: self.trigger_all("snipe")),
+            ("🛑 إيقاف","border-color:#da3633;",self.stop_all),
+            ("👁️ مطفأة","background:#6e7681;color:white;",self.show_hidden),
+            ("📋 سجلات","",self.log_window.show)]:
+            b = QPushButton(txt)
+            if sty: b.setStyleSheet(sty)
+            b.clicked.connect(fn); top.addWidget(b)
+        ml.addLayout(top)
         # جلسات
-        self.scroll = QScrollArea()
-        self.scroll.setWidgetResizable(True)
-        self.scroll.setStyleSheet("QScrollArea { border: none; background-color: transparent; }")
-        self.sessions_container = QWidget()
-        self.sessions_layout = QVBoxLayout(self.sessions_container)
-        self.sessions_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
-        self.scroll.setWidget(self.sessions_container)
-        main_lay.addWidget(self.scroll)
-
+        self.scroll = QScrollArea(); self.scroll.setWidgetResizable(True); self.scroll.setStyleSheet("QScrollArea{border:none;background:transparent;}")
+        self.sc = QWidget(); self.sl = QVBoxLayout(self.sc); self.sl.setAlignment(Qt.AlignmentFlag.AlignTop)
+        self.scroll.setWidget(self.sc); ml.addWidget(self.scroll)
         # تحميل
-        profiles_dir = os.path.join(os.getcwd(), "Profiles")
-        existing = []
-        max_num = 0
-        if os.path.exists(profiles_dir):
-            for f in os.listdir(profiles_dir):
+        pd = os.path.join(os.getcwd(),"Profiles"); ex=[]; mx=0
+        if os.path.exists(pd):
+            for f in os.listdir(pd):
                 if f.startswith("Profile_"):
-                    sid = f.replace("Profile_", "")
-                    existing.append(sid)
+                    sid=f[8:]; ex.append(sid)
                     if sid.startswith("رقم_"):
-                        try:
-                            n = int(sid.replace("رقم_", ""))
-                            if n > max_num:
-                                max_num = n
-                        except:
-                            pass
-        self.session_counter = max_num
-        if existing:
-            for sid in existing:
-                self._create_card(sid)
-        else:
-            self.add_session()
+                        try: n=int(sid[4:]);
+                        except: n=0
+                        if n>mx: mx=n
+        self.session_counter=mx
+        if ex:
+            for sid in ex: self._mk(sid)
+        else: self.add_session()
 
+    def _save_tg(self):
+        t,c = self.inp_tt.text().strip(), self.inp_tc.text().strip()
+        d=load_all_data(); d["TELEGRAM_CONFIG"]={"token":t,"chat_id":c}; save_all_data(d)
+        if t and c: threading.Thread(target=send_telegram_message, args=(t,c,"🤖 اختبار V18!"), daemon=True).start()
 
-    def save_test_tg(self):
-        token = self.inp_tg_token.text().strip()
-        chat_id = self.inp_tg_chat_id.text().strip()
-        all_data = load_all_data()
-        all_data["TELEGRAM_CONFIG"] = {"token": token, "chat_id": chat_id}
-        save_all_data(all_data)
-        if token and chat_id:
-            threading.Thread(target=send_telegram_message,
-                args=(token, chat_id, "🤖 <b>اختبار سرمدا V17</b> - يعمل!"), daemon=True).start()
-            QMessageBox.information(self, "نجاح", "تفقد التلجرام.")
-        else:
-            QMessageBox.warning(self, "تنبيه", "أدخل التوكن و Chat ID.")
-
-    def print_log(self, msg):
-        self.log_signal.emit(msg)
-
-    def _safe_log(self, msg):
-        self.log_window.append_log(msg)
-        print(msg)
-
-    def _create_card(self, sid):
-        card = SessionCard(sid, self.print_log, self.handle_rename, self.handle_delete)
-        self.sessions.append(card)
-        self.sessions_layout.addWidget(card)
-        self.print_log(f"[*] تم تحميل: {sid}")
-
-    def add_session(self):
-        self.session_counter += 1
-        self._create_card(f"رقم_{self.session_counter}")
-
-    def open_groups(self):
-        GroupActionDialog(self, self).exec()
-
+    def print_log(self, m): self.log_signal.emit(m)
+    def _slog(self, m): self.log_window.append_log(m); print(m)
+    def _mk(self, sid):
+        card = SessionCard(sid, self.print_log, self._ren, self._del)
+        self.sessions.append(card); self.sl.addWidget(card)
+    def add_session(self): self.session_counter+=1; self._mk(f"رقم_{self.session_counter}")
+    def open_groups(self): GroupActionDialog(self, self).exec()
     def fill_all(self):
         for c in self.sessions:
-            if not c.isHidden() and c.driver:
-                c.fill_browser(True)
-
+            if not c.isHidden() and c.driver: c.fill_browser(True)
     def renew_all(self):
         for c in self.sessions:
-            if not c.isHidden() and c.xsrf_token:
-                c.renew_session()
-
-    def trigger_all(self, mode):
+            if not c.isHidden() and c.xsrf_token: c.renew_session()
+    def trigger_all(self, m):
         for c in self.sessions:
-            if not c.isHidden() and c.xsrf_token:
-                c.start_request(mode)
-
+            if not c.isHidden() and c.xsrf_token: c.start_request(m)
     def stop_all(self):
-        for c in self.sessions:
-            c.stop_request()
-
-    def show_hidden(self):
-        HiddenSessionsDialog(self, self).exec()
-
-    def handle_rename(self, card, old_id, new_id):
-        if any(c.session_id == new_id for c in self.sessions):
-            QMessageBox.warning(self, "خطأ", "الاسم مستخدم.")
-            return
-        profiles_dir = os.path.join(os.getcwd(), "Profiles")
-        old_d = os.path.join(profiles_dir, f"Profile_{old_id}")
-        new_d = os.path.join(profiles_dir, f"Profile_{new_id}")
+        for c in self.sessions: c.stop_request()
+    def show_hidden(self): HiddenSessionsDialog(self, self).exec()
+    def _ren(self, card, old, new):
+        if any(c.session_id==new for c in self.sessions): return
+        pd=os.path.join(os.getcwd(),"Profiles")
         try:
-            if os.path.exists(old_d):
-                os.rename(old_d, new_d)
-        except Exception as e:
-            QMessageBox.critical(self, "خطأ", str(e))
-            return
-        all_data = load_all_data()
-        if old_id in all_data:
-            all_data[new_id] = all_data.pop(old_id)
-            save_all_data(all_data)
-        card.session_id = new_id
-        card.setTitle(f"جلسة: {new_id}")
-        self.print_log(f"[*] تسمية: {old_id} → {new_id}")
-
-    def handle_delete(self, card):
-        card.stop_request()
-        card.close_browser()
-        sid = card.session_id
-        all_data = load_all_data()
-        if sid in all_data:
-            del all_data[sid]
-            save_all_data(all_data)
-        p = os.path.join(os.getcwd(), "Profiles", f"Profile_{sid}")
-        if os.path.exists(p):
-            shutil.rmtree(p, ignore_errors=True)
-        self.sessions.remove(card)
-        card.setParent(None)
-        card.deleteLater()
-        self.print_log(f"[*] حُذفت: {sid}")
-
-    def closeEvent(self, event):
+            od=os.path.join(pd,f"Profile_{old}"); nd=os.path.join(pd,f"Profile_{new}")
+            if os.path.exists(od): os.rename(od,nd)
+        except: return
+        d=load_all_data()
+        if old in d: d[new]=d.pop(old); save_all_data(d)
+        card.session_id=new; card.setTitle(f"جلسة: {new}")
+    def _del(self, card):
+        card.stop_request(); card.close_browser(); sid=card.session_id
+        d=load_all_data()
+        if sid in d: del d[sid]; save_all_data(d)
+        p=os.path.join(os.getcwd(),"Profiles",f"Profile_{sid}")
+        if os.path.exists(p): shutil.rmtree(p, ignore_errors=True)
+        self.sessions.remove(card); card.setParent(None); card.deleteLater()
+    def closeEvent(self, ev):
         self.stop_all()
         for c in self.sessions:
-            if c.driver:
-                c.close_browser()
-        event.accept()
+            if c.driver: c.close_browser()
+        ev.accept()
 
 
 if __name__ == "__main__":
