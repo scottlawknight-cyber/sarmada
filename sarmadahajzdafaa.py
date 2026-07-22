@@ -469,320 +469,6 @@ class ShamCashWorker(QThread):
             self.result_signal.emit({"succeeded": False, "message": str(e)}, self.operation)
 
 
-class ShamCashSessionDialog(QDialog):
-    """نافذة جلسات شام كاش المرتبطة بكل جلسة حجز"""
-
-    def __init__(self, session_card, log_callback, parent=None):
-        super().__init__(parent)
-        self.session_card = session_card
-        self.log_callback = log_callback
-        self.shamcash_driver = None
-        self.shamcash_driver_lock = threading.Lock()
-        self.setWindowTitle(f"🏦 شام كاش - {session_card.session_id}")
-        self.resize(550, 500)
-        self.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
-        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
-        self.setStyleSheet("""
-            QDialog { background-color: #0d1117; color: #c9d1d9; }
-            QLabel { font-weight: bold; font-size: 13px; }
-            QLineEdit { background-color: #21262d; border: 1px solid #30363d; color: #58a6ff;
-                        font-weight: bold; border-radius: 4px; padding: 6px; }
-            QPushButton { border-radius: 4px; padding: 8px; font-weight: bold; }
-            QGroupBox { border: 2px solid #30363d; border-radius: 8px; margin-top: 10px; font-weight: bold; }
-            QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; color: #f0883e; }
-        """)
-        self.current_process_no = None
-        self.current_due_amount = None
-        self.setup_ui()
-        self.load_shamcash_data()
-
-    def setup_ui(self):
-        layout = QVBoxLayout(self)
-
-        # --- قسم تسجيل الدخول ---
-        login_grp = QGroupBox("🔐 تسجيل الدخول لشام كاش")
-        login_lay = QVBoxLayout()
-        btn_row = QHBoxLayout()
-        self.btn_open_shamcash = QPushButton("🌐 فتح متصفح شام كاش")
-        self.btn_open_shamcash.setStyleSheet("background-color: #1f6feb; color: white;")
-        self.btn_open_shamcash.clicked.connect(self.open_shamcash_browser)
-        self.btn_extract_tokens = QPushButton("🔑 سحب التوكنات وحفظها")
-        self.btn_extract_tokens.setStyleSheet("background-color: #238636; color: white;")
-        self.btn_extract_tokens.clicked.connect(self.extract_shamcash_tokens)
-        self.btn_close_shamcash = QPushButton("❌ إغلاق")
-        self.btn_close_shamcash.setStyleSheet("background-color: #da3633; color: white;")
-        self.btn_close_shamcash.clicked.connect(self.close_shamcash_browser)
-        btn_row.addWidget(self.btn_open_shamcash)
-        btn_row.addWidget(self.btn_extract_tokens)
-        btn_row.addWidget(self.btn_close_shamcash)
-        login_lay.addLayout(btn_row)
-        # حالة التوكنات
-        self.lbl_token_status = QLabel("حالة التوكنات: ❌ غير متصل")
-        self.lbl_token_status.setStyleSheet("color: #da3633;")
-        login_lay.addWidget(self.lbl_token_status)
-        login_grp.setLayout(login_lay)
-        layout.addWidget(login_grp)
-
-        # --- قسم الاستعلام والدفع ---
-        pay_grp = QGroupBox("💳 استعلام ودفع")
-        pay_lay = QVBoxLayout()
-        inp_row = QHBoxLayout()
-        inp_row.addWidget(QLabel("رقم المعاملة:"))
-        self.inp_process_num = QLineEdit()
-        self.inp_process_num.setPlaceholderText("أدخل رقم المعاملة (رمز الدفع)")
-        inp_row.addWidget(self.inp_process_num)
-        pay_lay.addLayout(inp_row)
-
-        action_row = QHBoxLayout()
-        self.btn_check = QPushButton("🔍 استعلام")
-        self.btn_check.setStyleSheet("background-color: #3b82f6; color: white;")
-        self.btn_check.clicked.connect(self.check_bill)
-        self.btn_pay = QPushButton("💰 دفع")
-        self.btn_pay.setStyleSheet("background-color: #10b981; color: white;")
-        self.btn_pay.clicked.connect(self.pay_bill)
-        self.btn_pay.setEnabled(False)
-        action_row.addWidget(self.btn_check)
-        action_row.addWidget(self.btn_pay)
-        pay_lay.addLayout(action_row)
-
-        # نتيجة
-        self.lbl_result = QLabel("النتيجة: بانتظار...")
-        self.lbl_result.setStyleSheet("color: #8b949e; font-size: 12px;")
-        self.lbl_result.setWordWrap(True)
-        pay_lay.addWidget(self.lbl_result)
-        pay_grp.setLayout(pay_lay)
-        layout.addWidget(pay_grp)
-
-        # --- سجل العمليات ---
-        log_grp = QGroupBox("📋 سجل العمليات")
-        log_lay = QVBoxLayout()
-        self.txt_log = QTextEdit()
-        self.txt_log.setReadOnly(True)
-        self.txt_log.setMaximumHeight(150)
-        self.txt_log.setStyleSheet("background-color: #161b22; color: #58a6ff; font-size: 12px;")
-        log_lay.addWidget(self.txt_log)
-        log_grp.setLayout(log_lay)
-        layout.addWidget(log_grp)
-
-    def log(self, msg):
-        self.txt_log.append(msg)
-        self.log_callback(msg)
-
-    def load_shamcash_data(self):
-        """تحميل بيانات شام كاش المحفوظة لهذه الجلسة"""
-        all_data = load_all_data()
-        session_data = all_data.get(self.session_card.session_id, {})
-        sc = session_data.get("shamcash", {})
-        if sc.get("auth_token") and sc.get("access_token") and sc.get("forge_cookie"):
-            self.session_card.shamcash_auth_token = sc["auth_token"]
-            self.session_card.shamcash_access_token = sc["access_token"]
-            self.session_card.shamcash_forge_cookie = sc["forge_cookie"]
-            self.lbl_token_status.setText("حالة التوكنات: ✅ متصل (محفوظ)")
-            self.lbl_token_status.setStyleSheet("color: #238636;")
-
-    def save_shamcash_data(self):
-        """حفظ بيانات شام كاش لهذه الجلسة"""
-        all_data = load_all_data()
-        if self.session_card.session_id not in all_data:
-            all_data[self.session_card.session_id] = {}
-        all_data[self.session_card.session_id]["shamcash"] = {
-            "auth_token": self.session_card.shamcash_auth_token,
-            "access_token": self.session_card.shamcash_access_token,
-            "forge_cookie": self.session_card.shamcash_forge_cookie
-        }
-        save_all_data(all_data)
-
-    def open_shamcash_browser(self):
-        """فتح متصفح مستقل لتسجيل الدخول لشام كاش"""
-        self.btn_open_shamcash.setEnabled(False)
-        self.btn_open_shamcash.setText("⏳ جاري الفتح...")
-        threading.Thread(target=self._open_browser_thread, daemon=True).start()
-
-    def _open_browser_thread(self):
-        try:
-            profile_dir = os.path.join(os.getcwd(), "Profiles",
-                                       f"ShamCash_{self.session_card.session_id}")
-            os.makedirs(profile_dir, exist_ok=True)
-            with GLOBAL_BROWSER_LOCK:
-                # تنظيف الأقفال
-                for lk in ["SingletonLock", "SingletonCookie", "SingletonSocket"]:
-                    p = os.path.join(profile_dir, lk)
-                    if os.path.exists(p):
-                        try:
-                            os.remove(p)
-                        except:
-                            pass
-                options = uc.ChromeOptions()
-                options.add_argument('--no-sandbox')
-                options.add_argument('--disable-dev-shm-usage')
-                options.add_argument('--disable-extensions')
-                options.add_argument('--disable-gpu')
-                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                    s.bind(('127.0.0.1', 0))
-                    free_port = s.getsockname()[1]
-                self.shamcash_driver = uc.Chrome(
-                    user_data_dir=profile_dir, options=options,
-                    use_subprocess=True, port=free_port,
-                    version_main=get_chrome_main_version())
-            time.sleep(1)
-            with self.shamcash_driver_lock:
-                if self.shamcash_driver:
-                    self.shamcash_driver.set_page_load_timeout(45)
-                    self.shamcash_driver.get("https://shamcash.sy/ar/application/home")
-            self.log(f"[+] [{self.session_card.session_id}] تم فتح متصفح شام كاش.")
-            self.btn_open_shamcash.setText("🌐 المتصفح مفتوح")
-        except Exception as e:
-            self.log(f"[!] [{self.session_card.session_id}] خطأ فتح شام كاش: {e}")
-            self.btn_open_shamcash.setEnabled(True)
-            self.btn_open_shamcash.setText("🌐 فتح متصفح شام كاش")
-
-    def extract_shamcash_tokens(self):
-        """سحب التوكنات من كوكيز المتصفح وحفظها بشكل دائم"""
-        with self.shamcash_driver_lock:
-            if not self.shamcash_driver:
-                QMessageBox.warning(self, "خطأ", "افتح متصفح شام كاش أولاً!")
-                return
-            try:
-                cookies = self.shamcash_driver.get_cookies()
-                auth_token = None
-                access_token = None
-                forge_cookie = None
-                for c in cookies:
-                    if c['name'] == 'authToken':
-                        auth_token = c['value']
-                    elif c['name'] == 'accessToken':
-                        access_token = c['value']
-                    elif c['name'] == 'forge':
-                        forge_cookie = c['value']
-
-                if auth_token and access_token and forge_cookie:
-                    self.session_card.shamcash_auth_token = auth_token
-                    self.session_card.shamcash_access_token = access_token
-                    self.session_card.shamcash_forge_cookie = forge_cookie
-                    self.save_shamcash_data()
-                    self.lbl_token_status.setText("حالة التوكنات: ✅ متصل ومحفوظ")
-                    self.lbl_token_status.setStyleSheet("color: #238636;")
-                    self.log(f"[+] [{self.session_card.session_id}] تم سحب وحفظ توكنات شام كاش بنجاح!")
-                    # التحقق من صحة المفتاح
-                    try:
-                        shamcash_get_session_key(forge_cookie)
-                        self.log(f"[+] [{self.session_card.session_id}] ✅ مفتاح الجلسة صالح.")
-                    except Exception as e:
-                        self.log(f"[!] [{self.session_card.session_id}] ⚠️ خطأ في فك forge: {e}")
-                else:
-                    missing = []
-                    if not auth_token:
-                        missing.append("authToken")
-                    if not access_token:
-                        missing.append("accessToken")
-                    if not forge_cookie:
-                        missing.append("forge")
-                    self.log(f"[-] [{self.session_card.session_id}] توكنات ناقصة: {', '.join(missing)}")
-                    self.lbl_token_status.setText(f"❌ ناقص: {', '.join(missing)}")
-                    self.lbl_token_status.setStyleSheet("color: #da3633;")
-                    QMessageBox.warning(self, "تنبيه",
-                        "يرجى تسجيل الدخول لشام كاش في المتصفح أولاً!")
-            except Exception as e:
-                self.log(f"[!] [{self.session_card.session_id}] خطأ سحب: {e}")
-
-    def close_shamcash_browser(self):
-        with self.shamcash_driver_lock:
-            if self.shamcash_driver:
-                try:
-                    self.shamcash_driver.quit()
-                except:
-                    pass
-                self.shamcash_driver = None
-        self.btn_open_shamcash.setEnabled(True)
-        self.btn_open_shamcash.setText("🌐 فتح متصفح شام كاش")
-        self.log(f"[*] [{self.session_card.session_id}] تم إغلاق متصفح شام كاش.")
-
-    def check_bill(self):
-        """استعلام عن فاتورة"""
-        process_num = self.inp_process_num.text().strip()
-        if not process_num:
-            QMessageBox.warning(self, "تنبيه", "أدخل رقم المعاملة!")
-            return
-        if not self.session_card.shamcash_auth_token:
-            QMessageBox.warning(self, "تنبيه", "سحب توكنات شام كاش أولاً!")
-            return
-        self.btn_check.setEnabled(False)
-        self.btn_check.setText("⏳...")
-        self.lbl_result.setText("⏳ جاري الاستعلام...")
-        self._worker = ShamCashWorker(
-            "check", self.session_card.session_id,
-            self.session_card.shamcash_auth_token,
-            self.session_card.shamcash_access_token,
-            self.session_card.shamcash_forge_cookie,
-            process_number=process_num)
-        self._worker.log_signal.connect(self.log)
-        self._worker.result_signal.connect(self._on_result)
-        self._worker.finished.connect(lambda: self._reset_btn(self.btn_check, "🔍 استعلام"))
-        self._worker.start()
-
-    def pay_bill(self):
-        """دفع الفاتورة"""
-        if not self.current_process_no or not self.current_due_amount:
-            QMessageBox.warning(self, "تنبيه", "قم بالاستعلام أولاً!")
-            return
-        self.btn_pay.setEnabled(False)
-        self.btn_pay.setText("⏳...")
-        self.lbl_result.setText("⏳ جاري الدفع...")
-        self._pay_worker = ShamCashWorker(
-            "pay", self.session_card.session_id,
-            self.session_card.shamcash_auth_token,
-            self.session_card.shamcash_access_token,
-            self.session_card.shamcash_forge_cookie,
-            process_no=self.current_process_no,
-            due_amount=self.current_due_amount)
-        self._pay_worker.log_signal.connect(self.log)
-        self._pay_worker.result_signal.connect(self._on_result)
-        self._pay_worker.finished.connect(lambda: self._reset_btn(self.btn_pay, "💰 دفع"))
-        self._pay_worker.start()
-
-    def _on_result(self, data, op_type):
-        if op_type == "check":
-            if data.get("succeeded") and data.get("data") and len(data["data"]) > 0:
-                fields = data["data"][0]
-                self.current_process_no = next(
-                    (item["value"] for item in fields if item["key"] == "process_no"), None)
-                self.current_due_amount = next(
-                    (item["value"] for item in fields if item["key"] == "due_amount"), None)
-                if self.current_process_no and self.current_due_amount:
-                    self.lbl_result.setText(
-                        f"✅ جاهز للدفع | المبلغ: {self.current_due_amount} ل.س | الرقم: {self.current_process_no}")
-                    self.lbl_result.setStyleSheet("color: #238636; font-size: 12px;")
-                    self.btn_pay.setEnabled(True)
-                    self.log(f"[+] [{self.session_card.session_id}] استعلام ناجح: {self.current_due_amount} ل.س")
-                else:
-                    self.lbl_result.setText("❌ لم يتم العثور على بيانات الدفع")
-                    self.lbl_result.setStyleSheet("color: #da3633; font-size: 12px;")
-            else:
-                msg = data.get("message", "خطأ غير معروف")
-                self.lbl_result.setText(f"❌ فشل: {msg}")
-                self.lbl_result.setStyleSheet("color: #da3633; font-size: 12px;")
-                self.btn_pay.setEnabled(False)
-        elif op_type == "pay":
-            if data.get("succeeded"):
-                self.lbl_result.setText("🎉 تم الدفع بنجاح!")
-                self.lbl_result.setStyleSheet("color: #238636; font-size: 14px;")
-                self.btn_pay.setEnabled(False)
-                self.log(f"[+] [{self.session_card.session_id}] 🎉 تم دفع شام كاش بنجاح!")
-            else:
-                msg = data.get("message", "خطأ غير معروف")
-                self.lbl_result.setText(f"❌ فشل الدفع: {msg}")
-                self.lbl_result.setStyleSheet("color: #da3633; font-size: 12px;")
-                self.log(f"[-] [{self.session_card.session_id}] فشل الدفع: {msg}")
-
-    def _reset_btn(self, btn, text):
-        btn.setEnabled(True)
-        btn.setText(text)
-
-    def closeEvent(self, event):
-        self.close_shamcash_browser()
-        super().closeEvent(event)
-
-
 class RequestWorker(QThread):
     """خيط واحد - يمكن إطلاق عدة نسخ بالتوازي"""
     log_signal = pyqtSignal(str)
@@ -1094,10 +780,16 @@ class SessionCard(QGroupBox):
 
         # --- شام كاش + دفع تلقائي ---
         shamcash_lay = QHBoxLayout()
-        self.btn_shamcash = QPushButton("🏦 جلسة شام كاش")
-        self.btn_shamcash.setStyleSheet("background-color: #f0883e; color: white; font-weight: bold;")
-        self.btn_shamcash.clicked.connect(self.open_shamcash_dialog)
-        shamcash_lay.addWidget(self.btn_shamcash)
+        self.btn_shamcash_login = QPushButton("🏦 فتح تبويب شام كاش")
+        self.btn_shamcash_login.setStyleSheet("background-color: #f0883e; color: white; font-weight: bold;")
+        self.btn_shamcash_login.setToolTip("يفتح shamcash.sy في نفس متصفح الجلسة كتبويب جديد")
+        self.btn_shamcash_login.clicked.connect(self.open_shamcash_tab_in_browser)
+        shamcash_lay.addWidget(self.btn_shamcash_login)
+        self.btn_shamcash_extract = QPushButton("🔑 سحب توكنات شام كاش")
+        self.btn_shamcash_extract.setStyleSheet("background-color: #238636; color: white; font-weight: bold;")
+        self.btn_shamcash_extract.setToolTip("يسحب التوكنات من كوكيز المتصفح ويحفظها دائماً")
+        self.btn_shamcash_extract.clicked.connect(self.extract_shamcash_tokens)
+        shamcash_lay.addWidget(self.btn_shamcash_extract)
         self.chk_auto_pay = QCheckBox("💳 دفع تلقائي فور وصول الرمز")
         self.chk_auto_pay.setStyleSheet("color: #10b981; font-weight: bold;")
         self.chk_auto_pay.setToolTip("عند تفعيله: فور حصولك على رمز دفع من الحجز، يتم الدفع تلقائياً عبر شام كاش (بدون بروكسي)")
@@ -1671,10 +1363,87 @@ class SessionCard(QGroupBox):
             QApplication.clipboard().setText(code)
             self.log(f"[+] [{self.session_id}] نُسخ: {code}")
 
-    def open_shamcash_dialog(self):
-        """فتح نافذة جلسات شام كاش المرتبطة بهذه الجلسة"""
-        dlg = ShamCashSessionDialog(self, self.log_callback)
-        dlg.exec()
+    def open_shamcash_tab_in_browser(self):
+        """فتح shamcash.sy في تبويب جديد بنفس متصفح الجلسة"""
+        with self.driver_lock:
+            if not self.driver:
+                QMessageBox.warning(self, "خطأ", "افتح المتصفح أولاً!")
+                return
+            try:
+                # فتح تبويب جديد
+                self.driver.execute_script("window.open('https://shamcash.sy/ar/application/home', '_blank');")
+                self.log(f"[+] [{self.session_id}] تم فتح تبويب شام كاش في المتصفح.")
+                self.lbl_shamcash_status.setText("🌐 تبويب شام كاش مفتوح")
+                self.lbl_shamcash_status.setStyleSheet("color: #e3b341; font-size: 11px;")
+            except Exception as e:
+                self.log(f"[!] [{self.session_id}] خطأ فتح تبويب شام كاش: {e}")
+
+    def extract_shamcash_tokens(self):
+        """سحب توكنات شام كاش من كوكيز المتصفح (نفس المتصفح) وحفظها بشكل دائم"""
+        with self.driver_lock:
+            if not self.driver:
+                QMessageBox.warning(self, "خطأ", "افتح المتصفح أولاً!")
+                return
+            try:
+                # الحصول على كوكيز shamcash.sy
+                # ننتقل لتبويب شام كاش إن وُجد
+                original_handle = self.driver.current_window_handle
+                shamcash_handle = None
+                for handle in self.driver.window_handles:
+                    self.driver.switch_to.window(handle)
+                    if "shamcash" in self.driver.current_url:
+                        shamcash_handle = handle
+                        break
+
+                if not shamcash_handle:
+                    # نحاول سحب الكوكيز حتى لو لم نجد التبويب (قد تكون محفوظة)
+                    self.driver.switch_to.window(original_handle)
+                    cookies = self.driver.get_cookies()
+                else:
+                    cookies = self.driver.get_cookies()
+                    # العودة للتبويب الأصلي
+                    self.driver.switch_to.window(original_handle)
+
+                auth_token = None
+                access_token = None
+                forge_cookie = None
+                for c in cookies:
+                    if c['name'] == 'authToken':
+                        auth_token = c['value']
+                    elif c['name'] == 'accessToken':
+                        access_token = c['value']
+                    elif c['name'] == 'forge':
+                        forge_cookie = c['value']
+
+                if auth_token and access_token and forge_cookie:
+                    self.shamcash_auth_token = auth_token
+                    self.shamcash_access_token = access_token
+                    self.shamcash_forge_cookie = forge_cookie
+                    self._save_data_internal(False)
+                    self.lbl_shamcash_status.setText("✅ توكنات شام كاش محفوظة")
+                    self.lbl_shamcash_status.setStyleSheet("color: #238636; font-size: 11px;")
+                    self.log(f"[+] [{self.session_id}] تم سحب وحفظ توكنات شام كاش بنجاح!")
+                    # التحقق من صحة المفتاح
+                    try:
+                        shamcash_get_session_key(forge_cookie)
+                        self.log(f"[+] [{self.session_id}] ✅ مفتاح الجلسة صالح.")
+                    except Exception as e:
+                        self.log(f"[!] [{self.session_id}] ⚠️ خطأ في فك forge: {e}")
+                else:
+                    missing = []
+                    if not auth_token:
+                        missing.append("authToken")
+                    if not access_token:
+                        missing.append("accessToken")
+                    if not forge_cookie:
+                        missing.append("forge")
+                    self.lbl_shamcash_status.setText(f"❌ ناقص: {', '.join(missing)}")
+                    self.lbl_shamcash_status.setStyleSheet("color: #da3633; font-size: 11px;")
+                    self.log(f"[-] [{self.session_id}] توكنات شام كاش ناقصة: {', '.join(missing)}")
+                    QMessageBox.warning(self, "تنبيه",
+                        "سجل الدخول لشام كاش في تبويب المتصفح أولاً!")
+            except Exception as e:
+                self.log(f"[!] [{self.session_id}] خطأ سحب توكنات شام كاش: {e}")
 
     def trigger_auto_pay(self, payment_code):
         """الدفع التلقائي عبر شام كاش فور وصول رمز الدفع - بدون بروكسي"""
@@ -1822,7 +1591,21 @@ class SarmadaPro(QMainWindow):
             top.addWidget(b)
         main_lay.addLayout(top)
 
-        # جلسات
+        # === تبويبات رئيسية ===
+        self.tab_widget = QTabWidget()
+        self.tab_widget.setStyleSheet("""
+            QTabWidget::pane { border: 1px solid #30363d; background-color: #0d1117; }
+            QTabBar::tab { background-color: #21262d; color: #c9d1d9; padding: 8px 16px;
+                           border: 1px solid #30363d; border-bottom: none; border-radius: 4px 4px 0 0;
+                           font-weight: bold; margin-right: 2px; }
+            QTabBar::tab:selected { background-color: #0d1117; color: #58a6ff; border-bottom: 2px solid #58a6ff; }
+            QTabBar::tab:hover { background-color: #30363d; }
+        """)
+
+        # --- تبويب 1: الجلسات ---
+        self.tab_sessions = QWidget()
+        tab_sessions_lay = QVBoxLayout(self.tab_sessions)
+        tab_sessions_lay.setContentsMargins(0, 5, 0, 0)
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
         self.scroll.setStyleSheet("QScrollArea { border: none; background-color: transparent; }")
@@ -1830,7 +1613,24 @@ class SarmadaPro(QMainWindow):
         self.sessions_layout = QVBoxLayout(self.sessions_container)
         self.sessions_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
         self.scroll.setWidget(self.sessions_container)
-        main_lay.addWidget(self.scroll)
+        tab_sessions_lay.addWidget(self.scroll)
+        self.tab_widget.addTab(self.tab_sessions, "📋 الجلسات")
+
+        # --- تبويب 2: جلسات شام كاش ---
+        self.tab_shamcash = QWidget()
+        self.tab_shamcash_lay = QVBoxLayout(self.tab_shamcash)
+        self.tab_shamcash_lay.setContentsMargins(5, 5, 5, 5)
+        self.shamcash_scroll = QScrollArea()
+        self.shamcash_scroll.setWidgetResizable(True)
+        self.shamcash_scroll.setStyleSheet("QScrollArea { border: none; background-color: transparent; }")
+        self.shamcash_container = QWidget()
+        self.shamcash_cards_layout = QVBoxLayout(self.shamcash_container)
+        self.shamcash_cards_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        self.shamcash_scroll.setWidget(self.shamcash_container)
+        self.tab_shamcash_lay.addWidget(self.shamcash_scroll)
+        self.tab_widget.addTab(self.tab_shamcash, "🏦 جلسات شام كاش")
+
+        main_lay.addWidget(self.tab_widget)
 
         # تحميل
         profiles_dir = os.path.join(os.getcwd(), "Profiles")
@@ -1880,7 +1680,224 @@ class SarmadaPro(QMainWindow):
         card = SessionCard(sid, self.print_log, self.handle_rename, self.handle_delete)
         self.sessions.append(card)
         self.sessions_layout.addWidget(card)
+        # إضافة بطاقة شام كاش في التبويب الثاني
+        self._create_shamcash_card(card)
         self.print_log(f"[*] تم تحميل: {sid}")
+
+    def _create_shamcash_card(self, card):
+        """إنشاء بطاقة شام كاش مصغرة في تبويب جلسات شام كاش"""
+        grp = QGroupBox(f"🏦 {card.session_id}")
+        grp.setStyleSheet(
+            "QGroupBox { border: 2px solid #30363d; border-radius: 8px; margin-top: 8px; font-weight: bold;}"
+            " QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; color: #f0883e;}")
+        lay = QVBoxLayout(grp)
+
+        # حالة التوكنات
+        status_lay = QHBoxLayout()
+        lbl_status = QLabel("❌ غير متصل")
+        lbl_status.setStyleSheet("color: #da3633; font-size: 12px;")
+        if card.shamcash_auth_token:
+            lbl_status.setText("✅ متصل (محفوظ)")
+            lbl_status.setStyleSheet("color: #238636; font-size: 12px;")
+        status_lay.addWidget(QLabel("حالة شام كاش:"))
+        status_lay.addWidget(lbl_status)
+        status_lay.addStretch()
+        lay.addLayout(status_lay)
+
+        # أزرار: فتح تبويب + سحب توكنات
+        btn_lay = QHBoxLayout()
+        btn_open = QPushButton("🌐 فتح تبويب تسجيل الدخول")
+        btn_open.setStyleSheet("background-color: #1f6feb; color: white; font-weight: bold;")
+        btn_open.clicked.connect(lambda: self._shamcash_open_tab(card, lbl_status))
+        btn_extract = QPushButton("🔑 سحب التوكنات وحفظها")
+        btn_extract.setStyleSheet("background-color: #238636; color: white; font-weight: bold;")
+        btn_extract.clicked.connect(lambda: self._shamcash_extract(card, lbl_status))
+        btn_lay.addWidget(btn_open)
+        btn_lay.addWidget(btn_extract)
+        lay.addLayout(btn_lay)
+
+        # استعلام ودفع يدوي
+        pay_lay = QHBoxLayout()
+        pay_lay.addWidget(QLabel("رمز الدفع:"))
+        inp_code = QLineEdit()
+        inp_code.setPlaceholderText("أدخل رمز الدفع للاستعلام/الدفع اليدوي")
+        pay_lay.addWidget(inp_code)
+        btn_check = QPushButton("🔍 استعلام")
+        btn_check.setStyleSheet("background-color: #3b82f6; color: white;")
+        btn_pay = QPushButton("💰 دفع")
+        btn_pay.setStyleSheet("background-color: #10b981; color: white;")
+        btn_pay.setEnabled(False)
+        lbl_result = QLabel("")
+        lbl_result.setStyleSheet("color: #8b949e; font-size: 11px;")
+        lbl_result.setWordWrap(True)
+
+        # تخزين مؤقت
+        card._shamcash_ui = {
+            'inp_code': inp_code, 'btn_check': btn_check,
+            'btn_pay': btn_pay, 'lbl_result': lbl_result,
+            'lbl_status': lbl_status, 'process_no': None, 'due_amount': None
+        }
+
+        btn_check.clicked.connect(lambda: self._shamcash_check(card))
+        btn_pay.clicked.connect(lambda: self._shamcash_pay(card))
+        pay_lay.addWidget(btn_check)
+        pay_lay.addWidget(btn_pay)
+        lay.addLayout(pay_lay)
+        lay.addWidget(lbl_result)
+
+        self.shamcash_cards_layout.addWidget(grp)
+
+    def _shamcash_open_tab(self, card, lbl_status):
+        """فتح تبويب شام كاش في نفس متصفح الجلسة"""
+        with card.driver_lock:
+            if not card.driver:
+                QMessageBox.warning(self, "خطأ", f"افتح متصفح الجلسة '{card.session_id}' أولاً!")
+                return
+            try:
+                card.driver.execute_script("window.open('https://shamcash.sy/ar/application/home', '_blank');")
+                lbl_status.setText("🌐 تبويب شام كاش مفتوح - سجل دخول")
+                lbl_status.setStyleSheet("color: #e3b341; font-size: 12px;")
+                self.print_log(f"[+] [{card.session_id}] تم فتح تبويب شام كاش.")
+            except Exception as e:
+                self.print_log(f"[!] [{card.session_id}] خطأ: {e}")
+
+    def _shamcash_extract(self, card, lbl_status):
+        """سحب توكنات شام كاش من نفس متصفح الجلسة"""
+        with card.driver_lock:
+            if not card.driver:
+                QMessageBox.warning(self, "خطأ", f"افتح متصفح الجلسة '{card.session_id}' أولاً!")
+                return
+            try:
+                original_handle = card.driver.current_window_handle
+                shamcash_handle = None
+                for handle in card.driver.window_handles:
+                    card.driver.switch_to.window(handle)
+                    if "shamcash" in card.driver.current_url:
+                        shamcash_handle = handle
+                        break
+                if not shamcash_handle:
+                    card.driver.switch_to.window(original_handle)
+                    cookies = card.driver.get_cookies()
+                else:
+                    cookies = card.driver.get_cookies()
+                    card.driver.switch_to.window(original_handle)
+
+                auth_token = None
+                access_token = None
+                forge_cookie = None
+                for c in cookies:
+                    if c['name'] == 'authToken':
+                        auth_token = c['value']
+                    elif c['name'] == 'accessToken':
+                        access_token = c['value']
+                    elif c['name'] == 'forge':
+                        forge_cookie = c['value']
+
+                if auth_token and access_token and forge_cookie:
+                    card.shamcash_auth_token = auth_token
+                    card.shamcash_access_token = access_token
+                    card.shamcash_forge_cookie = forge_cookie
+                    card._save_data_internal(False)
+                    lbl_status.setText("✅ متصل ومحفوظ")
+                    lbl_status.setStyleSheet("color: #238636; font-size: 12px;")
+                    card.lbl_shamcash_status.setText("✅ توكنات شام كاش محفوظة")
+                    card.lbl_shamcash_status.setStyleSheet("color: #238636; font-size: 11px;")
+                    self.print_log(f"[+] [{card.session_id}] تم سحب وحفظ توكنات شام كاش!")
+                    try:
+                        shamcash_get_session_key(forge_cookie)
+                        self.print_log(f"[+] [{card.session_id}] ✅ مفتاح الجلسة صالح.")
+                    except Exception as e:
+                        self.print_log(f"[!] [{card.session_id}] ⚠️ خطأ forge: {e}")
+                else:
+                    missing = []
+                    if not auth_token:
+                        missing.append("authToken")
+                    if not access_token:
+                        missing.append("accessToken")
+                    if not forge_cookie:
+                        missing.append("forge")
+                    lbl_status.setText(f"❌ ناقص: {', '.join(missing)}")
+                    lbl_status.setStyleSheet("color: #da3633; font-size: 12px;")
+                    self.print_log(f"[-] [{card.session_id}] توكنات ناقصة: {', '.join(missing)}")
+                    QMessageBox.warning(self, "تنبيه", "سجل الدخول لشام كاش أولاً في التبويب!")
+            except Exception as e:
+                self.print_log(f"[!] [{card.session_id}] خطأ: {e}")
+
+    def _shamcash_check(self, card):
+        """استعلام شام كاش يدوي"""
+        ui = card._shamcash_ui
+        code = ui['inp_code'].text().strip()
+        if not code:
+            QMessageBox.warning(self, "تنبيه", "أدخل رمز الدفع!")
+            return
+        if not card.shamcash_auth_token:
+            QMessageBox.warning(self, "تنبيه", "سحب توكنات شام كاش أولاً!")
+            return
+        ui['btn_check'].setEnabled(False)
+        ui['btn_check'].setText("⏳...")
+        ui['lbl_result'].setText("⏳ جاري الاستعلام...")
+        worker = ShamCashWorker("check", card.session_id,
+                                card.shamcash_auth_token, card.shamcash_access_token,
+                                card.shamcash_forge_cookie, process_number=code)
+        worker.log_signal.connect(self.print_log)
+        worker.result_signal.connect(lambda data, op: self._shamcash_on_result(card, data, op))
+        worker.finished.connect(lambda: self._shamcash_reset_btn(ui['btn_check'], "🔍 استعلام"))
+        card._shamcash_worker = worker
+        worker.start()
+
+    def _shamcash_pay(self, card):
+        """دفع شام كاش يدوي"""
+        ui = card._shamcash_ui
+        if not ui.get('process_no') or not ui.get('due_amount'):
+            QMessageBox.warning(self, "تنبيه", "قم بالاستعلام أولاً!")
+            return
+        ui['btn_pay'].setEnabled(False)
+        ui['btn_pay'].setText("⏳...")
+        ui['lbl_result'].setText("⏳ جاري الدفع...")
+        worker = ShamCashWorker("pay", card.session_id,
+                                card.shamcash_auth_token, card.shamcash_access_token,
+                                card.shamcash_forge_cookie,
+                                process_no=ui['process_no'], due_amount=ui['due_amount'])
+        worker.log_signal.connect(self.print_log)
+        worker.result_signal.connect(lambda data, op: self._shamcash_on_result(card, data, op))
+        worker.finished.connect(lambda: self._shamcash_reset_btn(ui['btn_pay'], "💰 دفع"))
+        card._shamcash_pay_worker = worker
+        worker.start()
+
+    def _shamcash_on_result(self, card, data, op_type):
+        ui = card._shamcash_ui
+        if op_type == "check":
+            if data.get("succeeded") and data.get("data") and len(data["data"]) > 0:
+                fields = data["data"][0]
+                pno = next((item["value"] for item in fields if item["key"] == "process_no"), None)
+                amt = next((item["value"] for item in fields if item["key"] == "due_amount"), None)
+                if pno and amt:
+                    ui['process_no'] = pno
+                    ui['due_amount'] = amt
+                    ui['lbl_result'].setText(f"✅ جاهز: {amt} ل.س | رقم: {pno}")
+                    ui['lbl_result'].setStyleSheet("color: #238636; font-size: 11px;")
+                    ui['btn_pay'].setEnabled(True)
+                else:
+                    ui['lbl_result'].setText("❌ لم يتم العثور على بيانات")
+                    ui['lbl_result'].setStyleSheet("color: #da3633; font-size: 11px;")
+            else:
+                msg = data.get("message", "خطأ")
+                ui['lbl_result'].setText(f"❌ {msg}")
+                ui['lbl_result'].setStyleSheet("color: #da3633; font-size: 11px;")
+                ui['btn_pay'].setEnabled(False)
+        elif op_type == "pay":
+            if data.get("succeeded"):
+                ui['lbl_result'].setText("🎉 تم الدفع بنجاح!")
+                ui['lbl_result'].setStyleSheet("color: #238636; font-size: 13px;")
+                ui['btn_pay'].setEnabled(False)
+            else:
+                msg = data.get("message", "خطأ")
+                ui['lbl_result'].setText(f"❌ فشل: {msg}")
+                ui['lbl_result'].setStyleSheet("color: #da3633; font-size: 11px;")
+
+    def _shamcash_reset_btn(self, btn, text):
+        btn.setEnabled(True)
+        btn.setText(text)
 
     def add_session(self):
         self.session_counter += 1
