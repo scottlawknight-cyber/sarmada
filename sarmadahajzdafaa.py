@@ -133,17 +133,24 @@ def send_telegram_message(token, chat_id, text, retries=3):
 # =============================================
 
 def shamcash_get_session_key(forge_cookie, master_key=SHAMCASH_MASTER_KEY):
-    """فك تشفير forge cookie لاستخراج مفتاح الجلسة"""
+    """فك تشفير forge cookie لاستخراج مفتاح الجلسة بأمان"""
     if not HAS_CRYPTO:
         raise ImportError("مكتبة pycryptodome غير مثبتة!")
-    parts = forge_cookie.split('.')
-    encrypted_data = base64.b64decode(parts[0])
-    iv = base64.b64decode(parts[1])
-    tag = encrypted_data[-16:]
-    ciphertext = encrypted_data[:-16]
-    cipher = AES.new(master_key, AES.MODE_GCM, nonce=iv)
-    cipher.update(b"")
-    return cipher.decrypt_and_verify(ciphertext, tag)
+    try:
+        parts = forge_cookie.split('.')
+        if len(parts) < 2:
+            raise ValueError("تنسيق كوكي forge غير صالح")
+        encrypted_data = base64.b64decode(parts[0])
+        iv = base64.b64decode(parts[1])
+        if len(encrypted_data) < 16:
+            raise ValueError("بيانات forge مشفرة قصيرة جداً")
+        tag = encrypted_data[-16:]
+        ciphertext = encrypted_data[:-16]
+        cipher = AES.new(master_key, AES.MODE_GCM, nonce=iv)
+        cipher.update(b"")
+        return cipher.decrypt_and_verify(ciphertext, tag)
+    except Exception as e:
+        raise ValueError(f"فشل فك تشفير forge: {e}")
 
 
 def shamcash_encrypt_payload(payload_dict, session_key, access_token, auth_token):
@@ -187,15 +194,14 @@ def shamcash_check_bill(process_number, auth_token, access_token, forge_cookie, 
     return response.json()
 
 
-def shamcash_pay_bill(process_no, due_amount, auth_token, access_token, forge_cookie, service_id=37):
-    """دفع فاتورة - بدون بروكسي (مستقل تماماً)"""
+def shamcash_pay_bill(bill_fields, auth_token, access_token, forge_cookie, service_id=37):
+    """دفع فاتورة - بدون بروكسي (مستقل تماماً)
+    bill_fields: قائمة الحقول الكاملة المرجعة من الاستعلام [{key, value}, ...]
+    """
     import requests as req_lib
     session_key = shamcash_get_session_key(forge_cookie)
     payload = {
-        "values": [
-            {"key": "process_no", "value": str(process_no)},
-            {"key": "due_amount", "value": str(due_amount)}
-        ]
+        "values": [{"key": f["key"], "value": f["value"]} for f in bill_fields]
     }
     enc_data = shamcash_encrypt_payload(payload, session_key, access_token, auth_token)
     url = f"{SHAMCASH_PAYMENT_URL}/pay?serviceId={service_id}"
@@ -438,7 +444,7 @@ class ShamCashWorker(QThread):
     result_signal = pyqtSignal(dict, str)  # data, operation_type
 
     def __init__(self, operation, session_id, auth_token, access_token, forge_cookie,
-                 process_number="", process_no="", due_amount="", service_id=37):
+                 process_number="", bill_fields=None, service_id=37):
         super().__init__()
         self.operation = operation  # "check" or "pay"
         self.session_id = session_id
@@ -446,8 +452,7 @@ class ShamCashWorker(QThread):
         self.access_token = access_token
         self.forge_cookie = forge_cookie
         self.process_number = process_number
-        self.process_no = process_no
-        self.due_amount = due_amount
+        self.bill_fields = bill_fields or []  # حقول الفاتورة الكاملة للدفع
         self.service_id = service_id
 
     def run(self):
@@ -459,9 +464,9 @@ class ShamCashWorker(QThread):
                     self.access_token, self.forge_cookie, self.service_id)
                 self.result_signal.emit(result, "check")
             elif self.operation == "pay":
-                self.log_signal.emit(f"💳 [{self.session_id}] جاري الدفع: {self.process_no} - {self.due_amount}")
+                self.log_signal.emit(f"💳 [{self.session_id}] جاري الدفع ({len(self.bill_fields)} حقل)...")
                 result = shamcash_pay_bill(
-                    self.process_no, self.due_amount, self.auth_token,
+                    self.bill_fields, self.auth_token,
                     self.access_token, self.forge_cookie, self.service_id)
                 self.result_signal.emit(result, "pay")
         except Exception as e:
@@ -1002,9 +1007,16 @@ class SessionCard(QGroupBox):
                         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                             s.bind(('127.0.0.1', 0))
                             free_port = s.getsockname()[1]
-                        self.driver = uc.Chrome(user_data_dir=profile_dir, options=options,
-                                                use_subprocess=True, port=free_port,
-                                                version_main=get_chrome_main_version())
+                        chrome_ver = get_chrome_main_version()
+                        chrome_kwargs = {
+                            'user_data_dir': profile_dir,
+                            'options': options,
+                            'use_subprocess': True,
+                            'port': free_port
+                        }
+                        if chrome_ver:
+                            chrome_kwargs['version_main'] = chrome_ver
+                        self.driver = uc.Chrome(**chrome_kwargs)
                         break
                     except Exception as e:
                         if attempt < 2:
@@ -1060,7 +1072,7 @@ class SessionCard(QGroupBox):
                 """)
                 if page_date:
                     self.inp_date.setText(page_date)
-                    self.log(f"[*] [{self.session_id}] تاريخ: {page_date}")
+                    self.log(f"[*] [{self.session_id}] تم التقاط التاريخ تلقائياً: {page_date}")
                 cookies = self.driver.get_cookies()
                 for c in cookies:
                     if c['name'] == 'XSRF-TOKEN':
@@ -1379,13 +1391,12 @@ class SessionCard(QGroupBox):
                 self.log(f"[!] [{self.session_id}] خطأ فتح تبويب شام كاش: {e}")
 
     def extract_shamcash_tokens(self):
-        """سحب توكنات شام كاش من كوكيز المتصفح (نفس المتصفح) وحفظها بشكل دائم"""
+        """سحب توكنات شام كاش من LocalStorage والـ Cookies بشكل متكامل"""
         with self.driver_lock:
             if not self.driver:
                 QMessageBox.warning(self, "خطأ", "افتح المتصفح أولاً!")
                 return
             try:
-                # الحصول على كوكيز shamcash.sy
                 # ننتقل لتبويب شام كاش إن وُجد
                 original_handle = self.driver.current_window_handle
                 shamcash_handle = None
@@ -1396,24 +1407,34 @@ class SessionCard(QGroupBox):
                         break
 
                 if not shamcash_handle:
-                    # نحاول سحب الكوكيز حتى لو لم نجد التبويب (قد تكون محفوظة)
-                    self.driver.switch_to.window(original_handle)
-                    cookies = self.driver.get_cookies()
-                else:
-                    cookies = self.driver.get_cookies()
-                    # العودة للتبويب الأصلي
                     self.driver.switch_to.window(original_handle)
 
-                auth_token = None
-                access_token = None
-                forge_cookie = None
+                # 1. محاولة السحب من LocalStorage أولاً
+                js_extract = """
+                return {
+                    'authToken': localStorage.getItem('authToken') || localStorage.getItem('token') || '',
+                    'accessToken': localStorage.getItem('accessToken') || '',
+                    'forge': localStorage.getItem('forge') || ''
+                };
+                """
+                ls_data = self.driver.execute_script(js_extract) or {}
+                auth_token = ls_data.get('authToken') or None
+                access_token = ls_data.get('accessToken') or None
+                forge_cookie = ls_data.get('forge') or None
+
+                # 2. إذا لم توجد في LocalStorage، نسحب من الكوكيز
+                cookies = self.driver.get_cookies()
                 for c in cookies:
-                    if c['name'] == 'authToken':
+                    if c['name'] == 'authToken' and not auth_token:
                         auth_token = c['value']
-                    elif c['name'] == 'accessToken':
+                    elif c['name'] == 'accessToken' and not access_token:
                         access_token = c['value']
-                    elif c['name'] == 'forge':
+                    elif c['name'] == 'forge' and not forge_cookie:
                         forge_cookie = c['value']
+
+                # العودة للتبويب الأصلي
+                if shamcash_handle:
+                    self.driver.switch_to.window(original_handle)
 
                 if auth_token and access_token and forge_cookie:
                     self.shamcash_auth_token = auth_token
@@ -1423,7 +1444,6 @@ class SessionCard(QGroupBox):
                     self.lbl_shamcash_status.setText("✅ توكنات شام كاش محفوظة")
                     self.lbl_shamcash_status.setStyleSheet("color: #238636; font-size: 11px;")
                     self.log(f"[+] [{self.session_id}] تم سحب وحفظ توكنات شام كاش بنجاح!")
-                    # التحقق من صحة المفتاح
                     try:
                         shamcash_get_session_key(forge_cookie)
                         self.log(f"[+] [{self.session_id}] ✅ مفتاح الجلسة صالح.")
@@ -1431,12 +1451,9 @@ class SessionCard(QGroupBox):
                         self.log(f"[!] [{self.session_id}] ⚠️ خطأ في فك forge: {e}")
                 else:
                     missing = []
-                    if not auth_token:
-                        missing.append("authToken")
-                    if not access_token:
-                        missing.append("accessToken")
-                    if not forge_cookie:
-                        missing.append("forge")
+                    if not auth_token: missing.append("authToken")
+                    if not access_token: missing.append("accessToken")
+                    if not forge_cookie: missing.append("forge")
                     self.lbl_shamcash_status.setText(f"❌ ناقص: {', '.join(missing)}")
                     self.lbl_shamcash_status.setStyleSheet("color: #da3633; font-size: 11px;")
                     self.log(f"[-] [{self.session_id}] توكنات شام كاش ناقصة: {', '.join(missing)}")
@@ -1470,13 +1487,12 @@ class SessionCard(QGroupBox):
                 self.shamcash_access_token, self.shamcash_forge_cookie)
             if result.get("succeeded") and result.get("data") and len(result["data"]) > 0:
                 fields = result["data"][0]
-                process_no = next((item["value"] for item in fields if item["key"] == "process_no"), None)
                 due_amount = next((item["value"] for item in fields if item["key"] == "due_amount"), None)
-                if process_no and due_amount:
+                if fields and due_amount:
                     self.log(f"[+] [{self.session_id}] ✅ استعلام ناجح: {due_amount} ل.س - جاري الدفع...")
-                    # 2. دفع
+                    # 2. دفع - إرسال كل الحقول الكاملة
                     pay_result = shamcash_pay_bill(
-                        process_no, due_amount, self.shamcash_auth_token,
+                        fields, self.shamcash_auth_token,
                         self.shamcash_access_token, self.shamcash_forge_cookie)
                     if pay_result.get("succeeded"):
                         self.log(f"[+] [{self.session_id}] 🎉🎉 تم الدفع التلقائي بنجاح! المبلغ: {due_amount} ل.س")
@@ -1762,7 +1778,7 @@ class SarmadaPro(QMainWindow):
                 self.print_log(f"[!] [{card.session_id}] خطأ: {e}")
 
     def _shamcash_extract(self, card, lbl_status):
-        """سحب توكنات شام كاش من نفس متصفح الجلسة"""
+        """سحب توكنات شام كاش من LocalStorage والكوكيز في نفس متصفح الجلسة"""
         with card.driver_lock:
             if not card.driver:
                 QMessageBox.warning(self, "خطأ", f"افتح متصفح الجلسة '{card.session_id}' أولاً!")
@@ -1777,21 +1793,33 @@ class SarmadaPro(QMainWindow):
                         break
                 if not shamcash_handle:
                     card.driver.switch_to.window(original_handle)
-                    cookies = card.driver.get_cookies()
-                else:
-                    cookies = card.driver.get_cookies()
-                    card.driver.switch_to.window(original_handle)
 
-                auth_token = None
-                access_token = None
-                forge_cookie = None
+                # 1. محاولة السحب من LocalStorage أولاً
+                js_extract = """
+                return {
+                    'authToken': localStorage.getItem('authToken') || localStorage.getItem('token') || '',
+                    'accessToken': localStorage.getItem('accessToken') || '',
+                    'forge': localStorage.getItem('forge') || ''
+                };
+                """
+                ls_data = card.driver.execute_script(js_extract) or {}
+                auth_token = ls_data.get('authToken') or None
+                access_token = ls_data.get('accessToken') or None
+                forge_cookie = ls_data.get('forge') or None
+
+                # 2. إذا لم توجد في LocalStorage، نسحب من الكوكيز
+                cookies = card.driver.get_cookies()
                 for c in cookies:
-                    if c['name'] == 'authToken':
+                    if c['name'] == 'authToken' and not auth_token:
                         auth_token = c['value']
-                    elif c['name'] == 'accessToken':
+                    elif c['name'] == 'accessToken' and not access_token:
                         access_token = c['value']
-                    elif c['name'] == 'forge':
+                    elif c['name'] == 'forge' and not forge_cookie:
                         forge_cookie = c['value']
+
+                # العودة للتبويب الأصلي
+                if shamcash_handle:
+                    card.driver.switch_to.window(original_handle)
 
                 if auth_token and access_token and forge_cookie:
                     card.shamcash_auth_token = auth_token
@@ -1810,12 +1838,9 @@ class SarmadaPro(QMainWindow):
                         self.print_log(f"[!] [{card.session_id}] ⚠️ خطأ forge: {e}")
                 else:
                     missing = []
-                    if not auth_token:
-                        missing.append("authToken")
-                    if not access_token:
-                        missing.append("accessToken")
-                    if not forge_cookie:
-                        missing.append("forge")
+                    if not auth_token: missing.append("authToken")
+                    if not access_token: missing.append("accessToken")
+                    if not forge_cookie: missing.append("forge")
                     lbl_status.setText(f"❌ ناقص: {', '.join(missing)}")
                     lbl_status.setStyleSheet("color: #da3633; font-size: 12px;")
                     self.print_log(f"[-] [{card.session_id}] توكنات ناقصة: {', '.join(missing)}")
@@ -1848,7 +1873,7 @@ class SarmadaPro(QMainWindow):
     def _shamcash_pay(self, card):
         """دفع شام كاش يدوي"""
         ui = card._shamcash_ui
-        if not ui.get('process_no') or not ui.get('due_amount'):
+        if not ui.get('bill_fields'):
             QMessageBox.warning(self, "تنبيه", "قم بالاستعلام أولاً!")
             return
         ui['btn_pay'].setEnabled(False)
@@ -1857,7 +1882,7 @@ class SarmadaPro(QMainWindow):
         worker = ShamCashWorker("pay", card.session_id,
                                 card.shamcash_auth_token, card.shamcash_access_token,
                                 card.shamcash_forge_cookie,
-                                process_no=ui['process_no'], due_amount=ui['due_amount'])
+                                bill_fields=ui['bill_fields'])
         worker.log_signal.connect(self.print_log)
         worker.result_signal.connect(lambda data, op: self._shamcash_on_result(card, data, op))
         worker.finished.connect(lambda: self._shamcash_reset_btn(ui['btn_pay'], "💰 دفع"))
@@ -1869,6 +1894,8 @@ class SarmadaPro(QMainWindow):
         if op_type == "check":
             if data.get("succeeded") and data.get("data") and len(data["data"]) > 0:
                 fields = data["data"][0]
+                # حفظ كل الحقول الكاملة للدفع
+                ui['bill_fields'] = fields
                 pno = next((item["value"] for item in fields if item["key"] == "process_no"), None)
                 amt = next((item["value"] for item in fields if item["key"] == "due_amount"), None)
                 if pno and amt:
