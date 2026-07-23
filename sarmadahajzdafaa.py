@@ -328,10 +328,28 @@ class GroupActionDialog(QDialog):
         btn_desel = QPushButton("☐ إلغاء التحديد")
         btn_desel.setStyleSheet("background-color: #3b3b3b; color: white;")
         btn_desel.clicked.connect(lambda: self._set_all(False))
+        btn_invert = QPushButton("🔄 عكس التحديد")
+        btn_invert.setStyleSheet("background-color: #3b3b3b; color: white;")
+        btn_invert.clicked.connect(self._invert_selection)
         top_bar.addWidget(btn_sel)
         top_bar.addWidget(btn_desel)
+        top_bar.addWidget(btn_invert)
         top_bar.addStretch()
         main_layout.addLayout(top_bar)
+
+        # --- تعديل التاريخ وتعميمه ---
+        date_bar = QHBoxLayout()
+        date_bar.addWidget(QLabel("📅 تعديل التاريخ:"))
+        self.inp_group_date = QLineEdit()
+        self.inp_group_date.setPlaceholderText("YYYY-MM-DD")
+        self.inp_group_date.setFixedWidth(130)
+        date_bar.addWidget(self.inp_group_date)
+        btn_apply_date = QPushButton("✅ تعميم للمحدد")
+        btn_apply_date.setStyleSheet("background-color: #1f6feb; color: white;")
+        btn_apply_date.clicked.connect(self._apply_date_to_selected)
+        date_bar.addWidget(btn_apply_date)
+        date_bar.addStretch()
+        main_layout.addLayout(date_bar)
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -346,6 +364,7 @@ class GroupActionDialog(QDialog):
         header.addWidget(QLabel("التاريخ"), 1)
         header.addWidget(QLabel("حالة"), 2)
         header.addWidget(QLabel("رمز الدفع"), 2)
+        header.addWidget(QLabel("💳"), 1)
         header.addWidget(QLabel(""), 1)
         self.list_layout.addLayout(header)
         line = QWidget()
@@ -358,7 +377,8 @@ class GroupActionDialog(QDialog):
             chk = QCheckBox(f"{card.session_id}")
             row.addWidget(chk, 2)
             row.addWidget(QLabel(card.inp_plate.text()), 1)
-            row.addWidget(QLabel(card.inp_date.text()), 1)
+            lbl_date = QLabel(card.inp_date.text())
+            row.addWidget(lbl_date, 1)
             lbl_st = QLabel(card.lbl_status.text())
             lbl_st.setStyleSheet(card.lbl_status.styleSheet())
             row.addWidget(lbl_st, 2)
@@ -370,12 +390,19 @@ class GroupActionDialog(QDialog):
             row.addWidget(inp, 2)
             c2 = card.payment_received.connect(lambda code, i=inp: i.setText(code))
             self.signal_connections.append((card.payment_received, c2))
+            # زر تفعيل الدفع التلقائي
+            chk_auto = QCheckBox()
+            chk_auto.setChecked(card.chk_auto_pay.isChecked())
+            chk_auto.setToolTip("تفعيل/إلغاء الدفع التلقائي")
+            chk_auto.setStyleSheet("color: #10b981;")
+            chk_auto.stateChanged.connect(lambda state, c=card: c.chk_auto_pay.setChecked(state == 2))
+            row.addWidget(chk_auto, 1)
             btn_cp = QPushButton("📋")
             btn_cp.setStyleSheet("background-color: #21262d; color: white;")
             btn_cp.clicked.connect(lambda ch, c=card, i=inp: self._copy(c, i.text()))
             row.addWidget(btn_cp, 1)
             self.list_layout.addLayout(row)
-            self.rows_data.append({'card': card, 'checkbox': chk})
+            self.rows_data.append({'card': card, 'checkbox': chk, 'lbl_date': lbl_date, 'chk_auto': chk_auto})
 
         scroll.setWidget(container)
         main_layout.addWidget(scroll)
@@ -399,6 +426,27 @@ class GroupActionDialog(QDialog):
         for r in self.rows_data:
             r['checkbox'].setChecked(state)
 
+    def _invert_selection(self):
+        for r in self.rows_data:
+            r['checkbox'].setChecked(not r['checkbox'].isChecked())
+
+    def _apply_date_to_selected(self):
+        """تعميم التاريخ المدخل على الجلسات المحددة"""
+        new_date = self.inp_group_date.text().strip()
+        if not new_date:
+            QMessageBox.warning(self, "تنبيه", "أدخل التاريخ أولاً!")
+            return
+        cnt = 0
+        for r in self.rows_data:
+            if r['checkbox'].isChecked():
+                r['card'].inp_date.setText(new_date)
+                r['lbl_date'].setText(new_date)
+                cnt += 1
+        if cnt:
+            self.main_window.print_log(f"[*] تم تعميم التاريخ ({new_date}) على {cnt} جلسة.")
+        else:
+            QMessageBox.warning(self, "تنبيه", "لم يتم تحديد أي جلسة.")
+
     def _upd_st(self, label, text, color):
         try:
             label.setText(text)
@@ -413,15 +461,27 @@ class GroupActionDialog(QDialog):
 
     def _exec(self, mode):
         cnt = 0
+        skipped = 0
         for r in self.rows_data:
             if r['checkbox'].isChecked():
-                if r['card'].xsrf_token:
-                    r['card'].start_request(mode)
+                card = r['card']
+                # تجاوز الجلسات التي نجحت ودفعت بالفعل
+                if "تم الحجز" in card.lbl_status.text() or "تم الدفع" in card.lbl_status.text():
+                    skipped += 1
+                    continue
+                if card.xsrf_token:
+                    card.start_request(mode)
                     cnt += 1
         if cnt:
-            self.main_window.print_log(f"[*] تم إطلاق ({mode}) لـ {cnt} جلسة.")
+            msg = f"[*] تم إطلاق ({mode}) لـ {cnt} جلسة."
+            if skipped:
+                msg += f" (تم تجاوز {skipped} جلسة ناجحة/مدفوعة)"
+            self.main_window.print_log(msg)
         else:
-            QMessageBox.warning(self, "تنبيه", "لم يتم تحديد جلسة صالحة.")
+            if skipped:
+                QMessageBox.information(self, "تنبيه", f"كل الجلسات المحددة ({skipped}) نجحت ودفعت بالفعل.")
+            else:
+                QMessageBox.warning(self, "تنبيه", "لم يتم تحديد جلسة صالحة.")
 
     def _stop(self):
         for r in self.rows_data:
