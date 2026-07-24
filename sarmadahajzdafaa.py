@@ -45,6 +45,56 @@ GLOBAL_BROWSER_LOCK = threading.Lock()
 GLOBAL_SOUND_LOCK = threading.Lock()
 FILE_LOCK = threading.Lock()
 DATA_FILE = "sarmada_data.json"
+SHAMCASH_TOKENS_FILE = "shamcash_tokens.json"
+
+
+def export_shamcash_tokens():
+    """تصدير كل توكنات شام كاش المحفوظة لملف JSON مستقل"""
+    all_data = load_all_data()
+    tokens = {}
+    for sid, data in all_data.items():
+        if sid == "TELEGRAM_CONFIG":
+            continue
+        sc = data.get("shamcash", {}) if isinstance(data, dict) else {}
+        if sc.get("auth_token"):
+            tokens[sid] = {
+                "auth_token": sc["auth_token"],
+                "access_token": sc.get("access_token", ""),
+                "forge_cookie": sc.get("forge_cookie", "")
+            }
+    try:
+        with open(SHAMCASH_TOKENS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(tokens, f, ensure_ascii=False, indent=4)
+        print(f"[+] تم تصدير {len(tokens)} توكن شام كاش إلى {SHAMCASH_TOKENS_FILE}")
+    except Exception as e:
+        print(f"[!] خطأ تصدير التوكنات: {e}")
+    return tokens
+
+
+def import_shamcash_tokens():
+    """استيراد توكنات شام كاش من ملف JSON وحفظها في البيانات"""
+    if not os.path.exists(SHAMCASH_TOKENS_FILE):
+        return {}, "ملف التوكنات غير موجود"
+    try:
+        with open(SHAMCASH_TOKENS_FILE, 'r', encoding='utf-8') as f:
+            tokens = json.load(f)
+        all_data = load_all_data()
+        imported = 0
+        for sid, sc in tokens.items():
+            if sid not in all_data:
+                all_data[sid] = {}
+            if not isinstance(all_data[sid], dict):
+                continue
+            all_data[sid]["shamcash"] = {
+                "auth_token": sc.get("auth_token", ""),
+                "access_token": sc.get("access_token", ""),
+                "forge_cookie": sc.get("forge_cookie", "")
+            }
+            imported += 1
+        save_all_data(all_data)
+        return tokens, f"تم استيراد {imported} توكن بنجاح"
+    except Exception as e:
+        return {}, f"خطأ: {e}"
 
 
 def load_all_data():
@@ -759,9 +809,14 @@ class SessionCard(QGroupBox):
         self.btn_close_browser = QPushButton("❌ إغلاق المتصفح")
         self.btn_close_browser.clicked.connect(self.close_browser)
         self.btn_close_browser.setStyleSheet("color: #ff7b72;")
+        self.btn_recover = QPushButton("🔧 إصلاح")
+        self.btn_recover.setToolTip("إصلاح المتصفح المتعطل (إغلاق وإعادة فتح)")
+        self.btn_recover.setStyleSheet("color: #f0883e;")
+        self.btn_recover.clicked.connect(self.recover_browser)
         br_lay.addWidget(self.btn_browser)
         br_lay.addWidget(self.btn_extract)
         br_lay.addWidget(self.btn_close_browser)
+        br_lay.addWidget(self.btn_recover)
         layout.addLayout(br_lay)
 
         # --- البيانات ---
@@ -855,6 +910,11 @@ class SessionCard(QGroupBox):
         self.btn_shamcash_extract.setToolTip("يسحب التوكنات من كوكيز المتصفح ويحفظها دائماً")
         self.btn_shamcash_extract.clicked.connect(self.extract_shamcash_tokens)
         shamcash_lay.addWidget(self.btn_shamcash_extract)
+        self.btn_shamcash_inject = QPushButton("💉 حقن التوكنات")
+        self.btn_shamcash_inject.setStyleSheet("background-color: #6f42c1; color: white; font-weight: bold;")
+        self.btn_shamcash_inject.setToolTip("حقن توكنات شام كاش المحفوظة في المتصفح لاستعادة الجلسة")
+        self.btn_shamcash_inject.clicked.connect(self.inject_shamcash_cookies)
+        shamcash_lay.addWidget(self.btn_shamcash_inject)
         self.chk_auto_pay = QCheckBox("💳 دفع تلقائي فور وصول الرمز")
         self.chk_auto_pay.setStyleSheet("color: #10b981; font-weight: bold;")
         self.chk_auto_pay.setToolTip("عند تفعيله: فور حصولك على رمز دفع من الحجز، يتم الدفع تلقائياً عبر شام كاش (بدون بروكسي)")
@@ -1162,6 +1222,123 @@ class SessionCard(QGroupBox):
                     self.driver = None
                     self._ui_browser_btn_signal.emit("🌐 فتح المتصفح", True)
                     self.update_status("المتصفح مغلق", "#8b949e")
+
+    def is_browser_alive(self):
+        """فحص إذا كان المتصفح لا يزال يعمل"""
+        with self.driver_lock:
+            if not self.driver:
+                return False
+            try:
+                _ = self.driver.current_url
+                return True
+            except:
+                return False
+
+    def recover_browser(self):
+        """إصلاح المتصفح المتعطل - إغلاق + حذف الكاش + إعادة فتح"""
+        self.log(f"[*] [{self.session_id}] 🔧 جاري إصلاح المتصفح المتعطل...")
+        with self.driver_lock:
+            if self.driver:
+                try:
+                    self.driver.quit()
+                except:
+                    pass
+                self.driver = None
+        # حذف الكاش مع المحافظة على البيانات المهمة
+        self.clean_browser_cache()
+        self._ui_browser_btn_signal.emit("🌐 فتح المتصفح", True)
+        self.update_status("إعادة تشغيل المتصفح...", "#e3b341")
+        # إعادة التشغيل
+        self.launch_browser()
+
+    def clean_browser_cache(self):
+        """حذف كاش المتصفح (2+ غيغا) مع المحافظة على توكنات Google وشام كاش"""
+        profile_dir = os.path.join(os.getcwd(), "Profiles", f"Profile_{self.session_id}")
+        if not os.path.exists(profile_dir):
+            return
+        # المجلدات والملفات الثقيلة التي يجب حذفها
+        dirs_to_delete = [
+            "Cache", "Code Cache", "GPUCache", "DawnCache",
+            "ShaderCache", "GrShaderCache", "Service Worker",
+            "blob_storage", "IndexedDB", "File System",
+            "optimization_guide_prediction_model_downloads",
+            "BrowserMetrics", "crash_count", "heavy_ad_intervention",
+        ]
+        files_to_delete = [
+            "Visited Links", "History", "History-journal",
+            "Top Sites", "Top Sites-journal", "Favicons", "Favicons-journal",
+            "Network Action Predictor", "TransportSecurity",
+        ]
+        # الملفات المهمة التي يجب المحافظة عليها
+        # Cookies, Login Data, Local State, Preferences, Web Data, bookmarks
+        deleted_size = 0
+        for d_name in dirs_to_delete:
+            # البحث في المجلد الرئيسي و Default
+            for base in [profile_dir, os.path.join(profile_dir, "Default")]:
+                d_path = os.path.join(base, d_name)
+                if os.path.exists(d_path) and os.path.isdir(d_path):
+                    try:
+                        size = sum(
+                            os.path.getsize(os.path.join(dp, f))
+                            for dp, dn, fnames in os.walk(d_path)
+                            for f in fnames
+                        )
+                        shutil.rmtree(d_path, ignore_errors=True)
+                        deleted_size += size
+                    except:
+                        pass
+        for f_name in files_to_delete:
+            for base in [profile_dir, os.path.join(profile_dir, "Default")]:
+                f_path = os.path.join(base, f_name)
+                if os.path.exists(f_path) and os.path.isfile(f_path):
+                    try:
+                        deleted_size += os.path.getsize(f_path)
+                        os.remove(f_path)
+                    except:
+                        pass
+        mb = deleted_size / (1024 * 1024)
+        self.log(f"[+] [{self.session_id}] 🧹 تم حذف {mb:.1f} MB من الكاش.")
+
+    def inject_shamcash_cookies(self):
+        """حقن توكنات شام كاش المحفوظة في المتصفح لاستعادة الجلسة"""
+        with self.driver_lock:
+            if not self.driver:
+                QMessageBox.warning(self, "خطأ", "افتح المتصفح أولاً!")
+                return
+            if not self.shamcash_auth_token or not self.shamcash_access_token or not self.shamcash_forge_cookie:
+                QMessageBox.warning(self, "خطأ", "لا توجد توكنات شام كاش محفوظة!")
+                return
+            try:
+                # التأكد من أننا على تبويب shamcash أو فتحه
+                current_url = self.driver.current_url
+                if "shamcash" not in current_url:
+                    self.driver.execute_script("window.open('https://shamcash.sy/ar/application/home', '_blank');")
+                    time.sleep(2)
+                    for handle in self.driver.window_handles:
+                        self.driver.switch_to.window(handle)
+                        if "shamcash" in self.driver.current_url:
+                            break
+
+                # حقن التوكنات في localStorage
+                self.driver.execute_script(f"""
+                    localStorage.setItem('authToken', '{self.shamcash_auth_token}');
+                    localStorage.setItem('accessToken', '{self.shamcash_access_token}');
+                    localStorage.setItem('forge', '{self.shamcash_forge_cookie}');
+                """)
+                # حقن في الكوكيز أيضاً
+                self.driver.add_cookie({"name": "authToken", "value": self.shamcash_auth_token, "domain": ".shamcash.sy"})
+                self.driver.add_cookie({"name": "accessToken", "value": self.shamcash_access_token, "domain": ".shamcash.sy"})
+                self.driver.add_cookie({"name": "forge", "value": self.shamcash_forge_cookie, "domain": ".shamcash.sy"})
+                # إعادة تحميل الصفحة
+                self.driver.refresh()
+                self.log(f"[+] [{self.session_id}] 💉 تم حقن توكنات شام كاش في المتصفح!")
+                self.lbl_shamcash_status.setText("✅ تم حقن التوكنات")
+                self.lbl_shamcash_status.setStyleSheet("color: #238636; font-size: 11px;")
+                # العودة للتبويب الأصلي
+                if "shamcash" not in current_url:
+                    self.driver.switch_to.window(self.driver.window_handles[0])
+            except Exception as e:
+                self.log(f"[!] [{self.session_id}] خطأ حقن التوكنات: {e}")
 
 
     def fill_browser(self, auto_submit=False):
@@ -1538,42 +1715,48 @@ class SessionCard(QGroupBox):
         threading.Thread(target=self._auto_pay_thread, args=(payment_code,), daemon=True).start()
 
     def _auto_pay_thread(self, payment_code):
-        """خيط الدفع التلقائي - مستقل وبدون بروكسي"""
+        """خيط الدفع التلقائي - ينتظر 10 ثوانٍ ثم يدفع مباشرة بدون استعلام، مع إعادة محاولة 3 مرات"""
         try:
-            # 1. استعلام
-            self.log(f"[*] [{self.session_id}] 🔍 استعلام شام كاش عن: {payment_code}")
-            result = shamcash_check_bill(
-                payment_code, self.shamcash_auth_token,
-                self.shamcash_access_token, self.shamcash_forge_cookie)
-            if result.get("succeeded") and result.get("data") and len(result["data"]) > 0:
-                fields = result["data"][0]
-                due_amount = next((item["value"] for item in fields if item["key"] == "due_amount"), None)
-                if fields and due_amount:
-                    self.log(f"[+] [{self.session_id}] ✅ استعلام ناجح: {due_amount} ل.س - جاري الدفع...")
-                    # 2. دفع - إرسال كل الحقول الكاملة
+            self.log(f"[*] [{self.session_id}] ⏳ انتظار 10 ثوانٍ قبل الدفع التلقائي للرمز: {payment_code}")
+            time.sleep(10)
+
+            # دفع مباشر بدون استعلام - إرسال process_number فقط
+            bill_fields = [{"key": "process_number", "value": str(payment_code)}]
+
+            max_retries = 3
+            for attempt in range(1, max_retries + 1):
+                self.log(f"[*] [{self.session_id}] 💳 محاولة الدفع {attempt}/{max_retries}...")
+                try:
                     pay_result = shamcash_pay_bill(
-                        fields, self.shamcash_auth_token,
+                        bill_fields, self.shamcash_auth_token,
                         self.shamcash_access_token, self.shamcash_forge_cookie)
                     if pay_result.get("succeeded"):
-                        self.log(f"[+] [{self.session_id}] 🎉🎉 تم الدفع التلقائي بنجاح! المبلغ: {due_amount} ل.س")
-                        self._ui_status_signal.emit(f"✅ تم الدفع ({due_amount})", "#238636")
+                        self.log(f"[+] [{self.session_id}] 🎉🎉 تم الدفع التلقائي بنجاح! (محاولة {attempt})")
+                        self._ui_status_signal.emit("✅ تم الدفع التلقائي", "#238636")
                         # إشعار تلجرام
                         all_data = load_all_data()
                         tg = all_data.get("TELEGRAM_CONFIG", {})
                         if tg.get("token") and tg.get("chat_id"):
                             msg = (f"💳 <b>دفع تلقائي ناجح!</b>\n🚗 {self.session_id}\n"
-                                   f"💰 {due_amount} ل.س\n"
-                                   f"🔢 الرمز: <code>{payment_code}</code>")
+                                   f"🔢 الرمز: <code>{payment_code}</code>\n"
+                                   f"🔄 المحاولة: {attempt}/{max_retries}")
                             threading.Thread(target=send_telegram_message,
                                            args=(tg["token"], tg["chat_id"], msg), daemon=True).start()
+                        return  # نجاح - نخرج
                     else:
                         msg = pay_result.get("message", "خطأ")
-                        self.log(f"[-] [{self.session_id}] ❌ فشل الدفع التلقائي: {msg}")
-                else:
-                    self.log(f"[-] [{self.session_id}] ❌ لم يتم العثور على بيانات الدفع في الاستعلام")
-            else:
-                msg = result.get("message", "خطأ غير معروف")
-                self.log(f"[-] [{self.session_id}] ❌ فشل استعلام شام كاش: {msg}")
+                        self.log(f"[-] [{self.session_id}] ❌ فشل الدفع (محاولة {attempt}): {msg}")
+                except Exception as e:
+                    self.log(f"[!] [{self.session_id}] ❌ خطأ في المحاولة {attempt}: {e}")
+
+                # إعادة محاولة بعد 5 ثوانٍ إن لم تكن المحاولة الأخيرة
+                if attempt < max_retries:
+                    self.log(f"[*] [{self.session_id}] ⏳ إعادة المحاولة بعد 5 ثوانٍ...")
+                    time.sleep(5)
+
+            # فشلت كل المحاولات
+            self.log(f"[!] [{self.session_id}] ❌ فشلت كل محاولات الدفع التلقائي ({max_retries} محاولات)")
+            self._ui_status_signal.emit("❌ فشل الدفع التلقائي", "#da3633")
         except Exception as e:
             self.log(f"[!] [{self.session_id}] ❌ خطأ في الدفع التلقائي: {e}")
 
@@ -1619,6 +1802,8 @@ class SarmadaPro(QMainWindow):
         self.log_signal.connect(self._safe_log)
         self.session_counter = 0
         self.setup_ui(load_all_data())
+        # تصدير توكنات شام كاش تلقائياً عند التشغيل
+        export_shamcash_tokens()
 
     def setup_ui(self, saved_data):
         central = QWidget()
@@ -1658,12 +1843,20 @@ class SarmadaPro(QMainWindow):
         btn_st = QPushButton("🛑 إيقاف الكل")
         btn_st.setStyleSheet("background-color: #da3633; color: white; font-weight: bold;")
         btn_st.clicked.connect(self.stop_all)
+        btn_recover = QPushButton("🔧 إصلاح المتعطلة")
+        btn_recover.setStyleSheet("background-color: #f0883e; color: white; font-weight: bold;")
+        btn_recover.setToolTip("يكشف المتصفحات المتعطلة ويعيد تشغيلها")
+        btn_recover.clicked.connect(self.recover_all_browsers)
+        btn_import_tokens = QPushButton("📥 استيراد توكنات")
+        btn_import_tokens.setStyleSheet("background-color: #6f42c1; color: white; font-weight: bold;")
+        btn_import_tokens.setToolTip("استيراد توكنات شام كاش من ملف shamcash_tokens.json")
+        btn_import_tokens.clicked.connect(self.import_tokens_from_file)
         btn_hid = QPushButton("👁️ المطفأة")
         btn_hid.setStyleSheet("background-color: #6e7681; color: white;")
         btn_hid.clicked.connect(self.show_hidden)
         btn_log = QPushButton("📋 السجلات")
         btn_log.clicked.connect(self.log_window.show)
-        for b in [btn_add, btn_grp, btn_st, btn_hid, btn_log]:
+        for b in [btn_add, btn_grp, btn_st, btn_recover, btn_import_tokens, btn_hid, btn_log]:
             top.addWidget(b)
         main_lay.addLayout(top)
 
@@ -1705,6 +1898,56 @@ class SarmadaPro(QMainWindow):
         self.shamcash_scroll.setWidget(self.shamcash_container)
         self.tab_shamcash_lay.addWidget(self.shamcash_scroll)
         self.tab_widget.addTab(self.tab_shamcash, "🏦 جلسات شام كاش")
+
+        # --- تبويب 3: إصلاح ---
+        self.tab_repair = QWidget()
+        self.tab_repair_lay = QVBoxLayout(self.tab_repair)
+        self.tab_repair_lay.setContentsMargins(10, 10, 10, 10)
+
+        # عنوان
+        lbl_title = QLabel("🔧 إصلاح وصيانة المتصفحات")
+        lbl_title.setStyleSheet("font-size: 16px; font-weight: bold; color: #f0883e;")
+        self.tab_repair_lay.addWidget(lbl_title)
+
+        # أزرار عامة
+        repair_top = QHBoxLayout()
+        btn_clean_all = QPushButton("🧹 حذف كاش الكل")
+        btn_clean_all.setStyleSheet("background-color: #da3633; color: white; font-weight: bold; padding: 10px;")
+        btn_clean_all.setToolTip("حذف الكاش من كل مجلدات المتصفحات (المحافظة على الكوكيز والتوكنات)")
+        btn_clean_all.clicked.connect(self._repair_clean_all_cache)
+        btn_recover_all = QPushButton("🔧 إصلاح كل المتعطلة")
+        btn_recover_all.setStyleSheet("background-color: #f0883e; color: white; font-weight: bold; padding: 10px;")
+        btn_recover_all.clicked.connect(self.recover_all_browsers)
+        btn_inject_all = QPushButton("💉 حقن توكنات شام كاش للكل")
+        btn_inject_all.setStyleSheet("background-color: #6f42c1; color: white; font-weight: bold; padding: 10px;")
+        btn_inject_all.setToolTip("حقن التوكنات المحفوظة في كل المتصفحات المفتوحة")
+        btn_inject_all.clicked.connect(self._repair_inject_all)
+        repair_top.addWidget(btn_clean_all)
+        repair_top.addWidget(btn_recover_all)
+        repair_top.addWidget(btn_inject_all)
+        self.tab_repair_lay.addLayout(repair_top)
+
+        # معلومات
+        info_lbl = QLabel(
+            "📌 حذف الكاش يحذف: Cache, Code Cache, GPUCache, ShaderCache, Service Worker, IndexedDB...\n"
+            "✅ يحافظ على: Cookies, Login Data (Google), Preferences, Web Data\n"
+            "💡 كل مجلد جلسة قد يصل إلى 2 غيغا بسبب الكاش - حذفه يحل التعليق")
+        info_lbl.setStyleSheet("color: #8b949e; font-size: 12px; padding: 10px;")
+        info_lbl.setWordWrap(True)
+        self.tab_repair_lay.addWidget(info_lbl)
+
+        # قائمة الجلسات مع حجم الكاش
+        repair_scroll = QScrollArea()
+        repair_scroll.setWidgetResizable(True)
+        repair_scroll.setStyleSheet("QScrollArea { border: none; background-color: transparent; }")
+        repair_container = QWidget()
+        self.repair_list_layout = QVBoxLayout(repair_container)
+        self.repair_list_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        repair_scroll.setWidget(repair_container)
+        self.tab_repair_lay.addWidget(repair_scroll)
+
+        self.tab_widget.addTab(self.tab_repair, "🔧 إصلاح")
+        self.tab_widget.currentChanged.connect(self._on_tab_changed)
 
         main_lay.addWidget(self.tab_widget)
 
@@ -1996,6 +2239,124 @@ class SarmadaPro(QMainWindow):
     def stop_all(self):
         for c in self.sessions:
             c.stop_request()
+
+    def recover_all_browsers(self):
+        """كشف وإصلاح المتصفحات المتعطلة"""
+        recovered = 0
+        for c in self.sessions:
+            if not c.isHidden() and c.driver and not c.is_browser_alive():
+                c.recover_browser()
+                recovered += 1
+        if recovered:
+            self.print_log(f"[*] 🔧 تم إصلاح {recovered} متصفح متعطل.")
+        else:
+            self.print_log("[*] ✅ لا توجد متصفحات متعطلة.")
+
+    def import_tokens_from_file(self):
+        """استيراد توكنات شام كاش من ملف JSON وتحديث الجلسات"""
+        tokens, msg = import_shamcash_tokens()
+        if not tokens:
+            QMessageBox.warning(self, "استيراد", msg)
+            return
+        # تحديث الجلسات الموجودة
+        updated = 0
+        for card in self.sessions:
+            if card.session_id in tokens:
+                sc = tokens[card.session_id]
+                card.shamcash_auth_token = sc.get("auth_token", "")
+                card.shamcash_access_token = sc.get("access_token", "")
+                card.shamcash_forge_cookie = sc.get("forge_cookie", "")
+                card.lbl_shamcash_status.setText("✅ مستورد")
+                card.lbl_shamcash_status.setStyleSheet("color: #238636; font-size: 11px;")
+                updated += 1
+        self.print_log(f"[+] 📥 {msg} | تحديث {updated} جلسة حالية.")
+        QMessageBox.information(self, "استيراد", f"{msg}\nتم تحديث {updated} جلسة.")
+
+    def _repair_clean_all_cache(self):
+        """حذف كاش كل مجلدات المتصفحات"""
+        total_cleaned = 0
+        for card in self.sessions:
+            card.clean_browser_cache()
+            total_cleaned += 1
+        self.print_log(f"[+] 🧹 تم تنظيف كاش {total_cleaned} جلسة.")
+        QMessageBox.information(self, "تنظيف", f"تم حذف كاش {total_cleaned} جلسة.\nيجب إعادة فتح المتصفحات.")
+        self._populate_repair_tab()
+
+    def _repair_inject_all(self):
+        """حقن توكنات شام كاش في كل المتصفحات المفتوحة"""
+        injected = 0
+        for card in self.sessions:
+            if card.driver and card.is_browser_alive() and card.shamcash_auth_token:
+                card.inject_shamcash_cookies()
+                injected += 1
+        if injected:
+            self.print_log(f"[+] 💉 تم حقن التوكنات في {injected} متصفح.")
+        else:
+            QMessageBox.warning(self, "حقن", "لا متصفحات مفتوحة أو لا توكنات محفوظة.")
+
+    def _populate_repair_tab(self):
+        """ملء تبويب الإصلاح بمعلومات الجلسات"""
+        # تنظيف القائمة
+        while self.repair_list_layout.count():
+            item = self.repair_list_layout.takeAt(0)
+            w = item.widget()
+            if w:
+                w.deleteLater()
+            elif item.layout():
+                while item.layout().count():
+                    sub = item.layout().takeAt(0)
+                    if sub.widget():
+                        sub.widget().deleteLater()
+
+        profiles_dir = os.path.join(os.getcwd(), "Profiles")
+        for card in self.sessions:
+            row = QHBoxLayout()
+            profile_path = os.path.join(profiles_dir, f"Profile_{card.session_id}")
+            # حساب حجم المجلد
+            size_mb = 0
+            if os.path.exists(profile_path):
+                try:
+                    for dp, dn, fnames in os.walk(profile_path):
+                        for f in fnames:
+                            fp = os.path.join(dp, f)
+                            if os.path.exists(fp):
+                                size_mb += os.path.getsize(fp)
+                except:
+                    pass
+            size_mb = size_mb / (1024 * 1024)
+            color = "#da3633" if size_mb > 500 else "#e3b341" if size_mb > 100 else "#238636"
+            lbl = QLabel(f"📂 {card.session_id} | {size_mb:.0f} MB")
+            lbl.setStyleSheet(f"color: {color}; font-weight: bold;")
+            row.addWidget(lbl, 3)
+            # حالة المتصفح
+            alive = "🟢" if card.driver and card.is_browser_alive() else "🔴" if card.driver else "⚪"
+            lbl_st = QLabel(alive)
+            row.addWidget(lbl_st, 1)
+            btn_clean = QPushButton("🧹 حذف كاش")
+            btn_clean.setStyleSheet("background-color: #da3633; color: white;")
+            btn_clean.clicked.connect(lambda ch, c=card: self._repair_clean_one(c))
+            row.addWidget(btn_clean, 1)
+            btn_fix = QPushButton("🔧 إصلاح")
+            btn_fix.setStyleSheet("background-color: #f0883e; color: white;")
+            btn_fix.clicked.connect(lambda ch, c=card: c.recover_browser())
+            row.addWidget(btn_fix, 1)
+            btn_inj = QPushButton("💉 حقن")
+            btn_inj.setStyleSheet("background-color: #6f42c1; color: white;")
+            btn_inj.clicked.connect(lambda ch, c=card: c.inject_shamcash_cookies())
+            row.addWidget(btn_inj, 1)
+            container = QWidget()
+            container.setLayout(row)
+            self.repair_list_layout.addWidget(container)
+
+    def _repair_clean_one(self, card):
+        """حذف كاش جلسة واحدة"""
+        card.clean_browser_cache()
+        self._populate_repair_tab()
+
+    def _on_tab_changed(self, index):
+        """عند تبديل التبويب - تحديث المحتوى"""
+        if index == 2:  # تبويب الإصلاح
+            self._populate_repair_tab()
 
     def show_hidden(self):
         HiddenSessionsDialog(self, self).exec()
