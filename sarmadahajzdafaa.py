@@ -45,6 +45,56 @@ GLOBAL_BROWSER_LOCK = threading.Lock()
 GLOBAL_SOUND_LOCK = threading.Lock()
 FILE_LOCK = threading.Lock()
 DATA_FILE = "sarmada_data.json"
+SHAMCASH_TOKENS_FILE = "shamcash_tokens.json"
+
+
+def export_shamcash_tokens():
+    """تصدير كل توكنات شام كاش المحفوظة لملف JSON مستقل"""
+    all_data = load_all_data()
+    tokens = {}
+    for sid, data in all_data.items():
+        if sid == "TELEGRAM_CONFIG":
+            continue
+        sc = data.get("shamcash", {}) if isinstance(data, dict) else {}
+        if sc.get("auth_token"):
+            tokens[sid] = {
+                "auth_token": sc["auth_token"],
+                "access_token": sc.get("access_token", ""),
+                "forge_cookie": sc.get("forge_cookie", "")
+            }
+    try:
+        with open(SHAMCASH_TOKENS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(tokens, f, ensure_ascii=False, indent=4)
+        print(f"[+] تم تصدير {len(tokens)} توكن شام كاش إلى {SHAMCASH_TOKENS_FILE}")
+    except Exception as e:
+        print(f"[!] خطأ تصدير التوكنات: {e}")
+    return tokens
+
+
+def import_shamcash_tokens():
+    """استيراد توكنات شام كاش من ملف JSON وحفظها في البيانات"""
+    if not os.path.exists(SHAMCASH_TOKENS_FILE):
+        return {}, "ملف التوكنات غير موجود"
+    try:
+        with open(SHAMCASH_TOKENS_FILE, 'r', encoding='utf-8') as f:
+            tokens = json.load(f)
+        all_data = load_all_data()
+        imported = 0
+        for sid, sc in tokens.items():
+            if sid not in all_data:
+                all_data[sid] = {}
+            if not isinstance(all_data[sid], dict):
+                continue
+            all_data[sid]["shamcash"] = {
+                "auth_token": sc.get("auth_token", ""),
+                "access_token": sc.get("access_token", ""),
+                "forge_cookie": sc.get("forge_cookie", "")
+            }
+            imported += 1
+        save_all_data(all_data)
+        return tokens, f"تم استيراد {imported} توكن بنجاح"
+    except Exception as e:
+        return {}, f"خطأ: {e}"
 
 
 def load_all_data():
@@ -759,9 +809,14 @@ class SessionCard(QGroupBox):
         self.btn_close_browser = QPushButton("❌ إغلاق المتصفح")
         self.btn_close_browser.clicked.connect(self.close_browser)
         self.btn_close_browser.setStyleSheet("color: #ff7b72;")
+        self.btn_recover = QPushButton("🔧 إصلاح")
+        self.btn_recover.setToolTip("إصلاح المتصفح المتعطل (إغلاق وإعادة فتح)")
+        self.btn_recover.setStyleSheet("color: #f0883e;")
+        self.btn_recover.clicked.connect(self.recover_browser)
         br_lay.addWidget(self.btn_browser)
         br_lay.addWidget(self.btn_extract)
         br_lay.addWidget(self.btn_close_browser)
+        br_lay.addWidget(self.btn_recover)
         layout.addLayout(br_lay)
 
         # --- البيانات ---
@@ -1163,6 +1218,32 @@ class SessionCard(QGroupBox):
                     self._ui_browser_btn_signal.emit("🌐 فتح المتصفح", True)
                     self.update_status("المتصفح مغلق", "#8b949e")
 
+    def is_browser_alive(self):
+        """فحص إذا كان المتصفح لا يزال يعمل"""
+        with self.driver_lock:
+            if not self.driver:
+                return False
+            try:
+                _ = self.driver.current_url
+                return True
+            except:
+                return False
+
+    def recover_browser(self):
+        """إصلاح المتصفح المتعطل - إغلاق وإعادة فتح"""
+        self.log(f"[*] [{self.session_id}] 🔧 جاري إصلاح المتصفح المتعطل...")
+        with self.driver_lock:
+            if self.driver:
+                try:
+                    self.driver.quit()
+                except:
+                    pass
+                self.driver = None
+        self._ui_browser_btn_signal.emit("🌐 فتح المتصفح", True)
+        self.update_status("إعادة تشغيل المتصفح...", "#e3b341")
+        # إعادة التشغيل
+        self.launch_browser()
+
 
     def fill_browser(self, auto_submit=False):
         with self.driver_lock:
@@ -1538,42 +1619,48 @@ class SessionCard(QGroupBox):
         threading.Thread(target=self._auto_pay_thread, args=(payment_code,), daemon=True).start()
 
     def _auto_pay_thread(self, payment_code):
-        """خيط الدفع التلقائي - مستقل وبدون بروكسي"""
+        """خيط الدفع التلقائي - ينتظر 10 ثوانٍ ثم يدفع مباشرة بدون استعلام، مع إعادة محاولة 3 مرات"""
         try:
-            # 1. استعلام
-            self.log(f"[*] [{self.session_id}] 🔍 استعلام شام كاش عن: {payment_code}")
-            result = shamcash_check_bill(
-                payment_code, self.shamcash_auth_token,
-                self.shamcash_access_token, self.shamcash_forge_cookie)
-            if result.get("succeeded") and result.get("data") and len(result["data"]) > 0:
-                fields = result["data"][0]
-                due_amount = next((item["value"] for item in fields if item["key"] == "due_amount"), None)
-                if fields and due_amount:
-                    self.log(f"[+] [{self.session_id}] ✅ استعلام ناجح: {due_amount} ل.س - جاري الدفع...")
-                    # 2. دفع - إرسال كل الحقول الكاملة
+            self.log(f"[*] [{self.session_id}] ⏳ انتظار 10 ثوانٍ قبل الدفع التلقائي للرمز: {payment_code}")
+            time.sleep(10)
+
+            # دفع مباشر بدون استعلام - إرسال process_number فقط
+            bill_fields = [{"key": "process_number", "value": str(payment_code)}]
+
+            max_retries = 3
+            for attempt in range(1, max_retries + 1):
+                self.log(f"[*] [{self.session_id}] 💳 محاولة الدفع {attempt}/{max_retries}...")
+                try:
                     pay_result = shamcash_pay_bill(
-                        fields, self.shamcash_auth_token,
+                        bill_fields, self.shamcash_auth_token,
                         self.shamcash_access_token, self.shamcash_forge_cookie)
                     if pay_result.get("succeeded"):
-                        self.log(f"[+] [{self.session_id}] 🎉🎉 تم الدفع التلقائي بنجاح! المبلغ: {due_amount} ل.س")
-                        self._ui_status_signal.emit(f"✅ تم الدفع ({due_amount})", "#238636")
+                        self.log(f"[+] [{self.session_id}] 🎉🎉 تم الدفع التلقائي بنجاح! (محاولة {attempt})")
+                        self._ui_status_signal.emit("✅ تم الدفع التلقائي", "#238636")
                         # إشعار تلجرام
                         all_data = load_all_data()
                         tg = all_data.get("TELEGRAM_CONFIG", {})
                         if tg.get("token") and tg.get("chat_id"):
                             msg = (f"💳 <b>دفع تلقائي ناجح!</b>\n🚗 {self.session_id}\n"
-                                   f"💰 {due_amount} ل.س\n"
-                                   f"🔢 الرمز: <code>{payment_code}</code>")
+                                   f"🔢 الرمز: <code>{payment_code}</code>\n"
+                                   f"🔄 المحاولة: {attempt}/{max_retries}")
                             threading.Thread(target=send_telegram_message,
                                            args=(tg["token"], tg["chat_id"], msg), daemon=True).start()
+                        return  # نجاح - نخرج
                     else:
                         msg = pay_result.get("message", "خطأ")
-                        self.log(f"[-] [{self.session_id}] ❌ فشل الدفع التلقائي: {msg}")
-                else:
-                    self.log(f"[-] [{self.session_id}] ❌ لم يتم العثور على بيانات الدفع في الاستعلام")
-            else:
-                msg = result.get("message", "خطأ غير معروف")
-                self.log(f"[-] [{self.session_id}] ❌ فشل استعلام شام كاش: {msg}")
+                        self.log(f"[-] [{self.session_id}] ❌ فشل الدفع (محاولة {attempt}): {msg}")
+                except Exception as e:
+                    self.log(f"[!] [{self.session_id}] ❌ خطأ في المحاولة {attempt}: {e}")
+
+                # إعادة محاولة بعد 5 ثوانٍ إن لم تكن المحاولة الأخيرة
+                if attempt < max_retries:
+                    self.log(f"[*] [{self.session_id}] ⏳ إعادة المحاولة بعد 5 ثوانٍ...")
+                    time.sleep(5)
+
+            # فشلت كل المحاولات
+            self.log(f"[!] [{self.session_id}] ❌ فشلت كل محاولات الدفع التلقائي ({max_retries} محاولات)")
+            self._ui_status_signal.emit("❌ فشل الدفع التلقائي", "#da3633")
         except Exception as e:
             self.log(f"[!] [{self.session_id}] ❌ خطأ في الدفع التلقائي: {e}")
 
@@ -1619,6 +1706,8 @@ class SarmadaPro(QMainWindow):
         self.log_signal.connect(self._safe_log)
         self.session_counter = 0
         self.setup_ui(load_all_data())
+        # تصدير توكنات شام كاش تلقائياً عند التشغيل
+        export_shamcash_tokens()
 
     def setup_ui(self, saved_data):
         central = QWidget()
@@ -1658,12 +1747,20 @@ class SarmadaPro(QMainWindow):
         btn_st = QPushButton("🛑 إيقاف الكل")
         btn_st.setStyleSheet("background-color: #da3633; color: white; font-weight: bold;")
         btn_st.clicked.connect(self.stop_all)
+        btn_recover = QPushButton("🔧 إصلاح المتعطلة")
+        btn_recover.setStyleSheet("background-color: #f0883e; color: white; font-weight: bold;")
+        btn_recover.setToolTip("يكشف المتصفحات المتعطلة ويعيد تشغيلها")
+        btn_recover.clicked.connect(self.recover_all_browsers)
+        btn_import_tokens = QPushButton("📥 استيراد توكنات")
+        btn_import_tokens.setStyleSheet("background-color: #6f42c1; color: white; font-weight: bold;")
+        btn_import_tokens.setToolTip("استيراد توكنات شام كاش من ملف shamcash_tokens.json")
+        btn_import_tokens.clicked.connect(self.import_tokens_from_file)
         btn_hid = QPushButton("👁️ المطفأة")
         btn_hid.setStyleSheet("background-color: #6e7681; color: white;")
         btn_hid.clicked.connect(self.show_hidden)
         btn_log = QPushButton("📋 السجلات")
         btn_log.clicked.connect(self.log_window.show)
-        for b in [btn_add, btn_grp, btn_st, btn_hid, btn_log]:
+        for b in [btn_add, btn_grp, btn_st, btn_recover, btn_import_tokens, btn_hid, btn_log]:
             top.addWidget(b)
         main_lay.addLayout(top)
 
@@ -1996,6 +2093,38 @@ class SarmadaPro(QMainWindow):
     def stop_all(self):
         for c in self.sessions:
             c.stop_request()
+
+    def recover_all_browsers(self):
+        """كشف وإصلاح المتصفحات المتعطلة"""
+        recovered = 0
+        for c in self.sessions:
+            if not c.isHidden() and c.driver and not c.is_browser_alive():
+                c.recover_browser()
+                recovered += 1
+        if recovered:
+            self.print_log(f"[*] 🔧 تم إصلاح {recovered} متصفح متعطل.")
+        else:
+            self.print_log("[*] ✅ لا توجد متصفحات متعطلة.")
+
+    def import_tokens_from_file(self):
+        """استيراد توكنات شام كاش من ملف JSON وتحديث الجلسات"""
+        tokens, msg = import_shamcash_tokens()
+        if not tokens:
+            QMessageBox.warning(self, "استيراد", msg)
+            return
+        # تحديث الجلسات الموجودة
+        updated = 0
+        for card in self.sessions:
+            if card.session_id in tokens:
+                sc = tokens[card.session_id]
+                card.shamcash_auth_token = sc.get("auth_token", "")
+                card.shamcash_access_token = sc.get("access_token", "")
+                card.shamcash_forge_cookie = sc.get("forge_cookie", "")
+                card.lbl_shamcash_status.setText("✅ مستورد")
+                card.lbl_shamcash_status.setStyleSheet("color: #238636; font-size: 11px;")
+                updated += 1
+        self.print_log(f"[+] 📥 {msg} | تحديث {updated} جلسة حالية.")
+        QMessageBox.information(self, "استيراد", f"{msg}\nتم تحديث {updated} جلسة.")
 
     def show_hidden(self):
         HiddenSessionsDialog(self, self).exec()
