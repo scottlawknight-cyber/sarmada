@@ -37,6 +37,16 @@ except ImportError:
 # =============================================
 SHAMCASH_MASTER_KEY = b"g0Zrgp8XRK/BN2ZAtUfJDQ=="  # مفتاح فك forge
 SHAMCASH_PAYMENT_URL = "https://payment.shamcash.sy/v4/api/Billing"
+SHAMCASH_API_URL = "https://api.shamcash.sy/v4/api"
+
+SHAMCASH_RSA_PUB_KEY = """-----BEGIN RSA PUBLIC KEY-----
+MIIBCgKCAQEAuj8jcVjIoCND5p0ZIDMcNkPV3YzF3zywvB0az6Vorb+VHeAlUHut
+WNRMmyVr3Eu+pPx27v+V7V60Nq9j5QSTeHXC4ndMuHrRUDc8IEhDcbOFdPEwrA6Q
+UH+K1d8VQUcXOHPRcx0xEDtNwW8dKP6ySI3tt61HWp+/s133+OIAUKyH5BmWmauj
+tJWaRfxwVA3okvwHMgWRfK0Nyxe6yFnmO4izOqKt/Pph0uPZVXL4/JawC5lvuwbk
+SMuPGJjRN34YuMje1mkvArHTSeJ7dplqG6rXIg1X75m1elFu4GiLCc76SqgQBmXW
+KSe5sprj2OrooP5B/liFD0LnsuVBWRarFQIDAQAB
+-----END RSA PUBLIC KEY-----"""
 
 if sys.platform == 'win32':
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
@@ -245,15 +255,40 @@ def shamcash_check_bill(process_number, auth_token, access_token, forge_cookie, 
 
 
 def shamcash_pay_bill(bill_fields, auth_token, access_token, forge_cookie, service_id=37):
-    """دفع فاتورة - بدون بروكسي (مستقل تماماً)
-    bill_fields: قائمة الحقول الكاملة المرجعة من الاستعلام [{key, value}, ...]
+    """دفع فاتورة مباشر بتشفير RSA+AES (بدون بروكسي)
+    bill_fields: [{key, value}, ...] - عادة [{"key":"process_number","value":"XXXX"}]
     """
     import requests as req_lib
-    session_key = shamcash_get_session_key(forge_cookie)
+    if not HAS_CRYPTO:
+        raise ImportError("مكتبة pycryptodome غير مثبتة!")
+    from Crypto.PublicKey import RSA
+    from Crypto.Cipher import PKCS1_v1_5
+
+    # 1. توليد مفتاح AES عشوائي
+    raw_key = os.urandom(16)
+    aes_key_b64 = base64.b64encode(raw_key).decode().replace('+', '-').replace('/', '_')
+
+    # 2. تشفير مفتاح AES بـ RSA
+    rsa_key = RSA.import_key(SHAMCASH_RSA_PUB_KEY)
+    rsa_cipher = PKCS1_v1_5.new(rsa_key)
+    encrypted_aes_key = base64.b64encode(rsa_cipher.encrypt(aes_key_b64.encode())).decode()
+
+    # 3. بناء payload الدفع
     payload = {
-        "values": [{"key": f["key"], "value": f["value"]} for f in bill_fields]
+        "values": [{"key": f["key"], "value": f["value"]} for f in bill_fields],
+        "accessToken": access_token,
+        "SessionId": _get_session_id_from_jwt(auth_token)
     }
-    enc_data = shamcash_encrypt_payload(payload, session_key, access_token, auth_token)
+    json_payload = json.dumps(payload, separators=(',', ':'))
+
+    # 4. تشفير الـ payload بـ AES-GCM
+    iv = os.urandom(12)
+    cipher = AES.new(raw_key, AES.MODE_GCM, nonce=iv)
+    cipher.update(b"")
+    ciphertext, tag = cipher.encrypt_and_digest(json_payload.encode('utf-8'))
+    enc_data = base64.b64encode(ciphertext + tag).decode() + "." + base64.b64encode(iv).decode()
+
+    # 5. إرسال الطلب
     url = f"{SHAMCASH_PAYMENT_URL}/pay?serviceId={service_id}"
     headers = {
         "accept": "application/json",
@@ -266,8 +301,16 @@ def shamcash_pay_bill(bill_fields, auth_token, access_token, forge_cookie, servi
         "referer": "https://shamcash.sy/ar/application/home",
         "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
     }
-    response = req_lib.post(url, json={"encData": enc_data}, headers=headers, timeout=30)
+    request_body = {"encData": enc_data, "aesKey": encrypted_aes_key}
+    response = req_lib.post(url, json=request_body, headers=headers, timeout=30)
     return response.json()
+
+
+def _get_session_id_from_jwt(auth_token):
+    """استخراج SessionId من JWT"""
+    jwt_payload = auth_token.split('.')[1]
+    jwt_payload += '=' * (4 - len(jwt_payload) % 4)
+    return json.loads(base64.b64decode(jwt_payload).decode('utf-8'))['SessionId']
 
 
 class LogWindow(QDialog):
