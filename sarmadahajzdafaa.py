@@ -2037,13 +2037,12 @@ class SarmadaPro(QMainWindow):
         pay_lay = QHBoxLayout()
         pay_lay.addWidget(QLabel("رمز الدفع:"))
         inp_code = QLineEdit()
-        inp_code.setPlaceholderText("أدخل رمز الدفع للاستعلام/الدفع اليدوي")
+        inp_code.setPlaceholderText("أدخل رمز الدفع")
         pay_lay.addWidget(inp_code)
         btn_check = QPushButton("🔍 استعلام")
         btn_check.setStyleSheet("background-color: #3b82f6; color: white;")
-        btn_pay = QPushButton("💰 دفع")
+        btn_pay = QPushButton("💰 دفع مباشر")
         btn_pay.setStyleSheet("background-color: #10b981; color: white;")
-        btn_pay.setEnabled(False)
         lbl_result = QLabel("")
         lbl_result.setStyleSheet("color: #8b949e; font-size: 11px;")
         lbl_result.setWordWrap(True)
@@ -2172,21 +2171,27 @@ class SarmadaPro(QMainWindow):
         worker.start()
 
     def _shamcash_pay(self, card):
-        """دفع شام كاش يدوي"""
+        """دفع شام كاش مباشر بدون استعلام"""
         ui = card._shamcash_ui
-        if not ui.get('bill_fields'):
-            QMessageBox.warning(self, "تنبيه", "قم بالاستعلام أولاً!")
+        code = ui['inp_code'].text().strip()
+        if not code:
+            QMessageBox.warning(self, "تنبيه", "أدخل رمز الدفع!")
             return
+        if not card.shamcash_auth_token:
+            QMessageBox.warning(self, "تنبيه", "سحب توكنات شام كاش أولاً!")
+            return
+        # دفع مباشر - إرسال process_number فقط بدون استعلام
+        bill_fields = [{"key": "process_number", "value": str(code)}]
         ui['btn_pay'].setEnabled(False)
         ui['btn_pay'].setText("⏳...")
-        ui['lbl_result'].setText("⏳ جاري الدفع...")
+        ui['lbl_result'].setText("⏳ جاري الدفع المباشر...")
         worker = ShamCashWorker("pay", card.session_id,
                                 card.shamcash_auth_token, card.shamcash_access_token,
                                 card.shamcash_forge_cookie,
-                                bill_fields=ui['bill_fields'])
+                                bill_fields=bill_fields)
         worker.log_signal.connect(self.print_log)
         worker.result_signal.connect(lambda data, op: self._shamcash_on_result(card, data, op))
-        worker.finished.connect(lambda: self._shamcash_reset_btn(ui['btn_pay'], "💰 دفع"))
+        worker.finished.connect(lambda: self._shamcash_reset_btn(ui['btn_pay'], "💰 دفع مباشر"))
         card._shamcash_pay_worker = worker
         worker.start()
 
