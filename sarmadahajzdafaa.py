@@ -255,40 +255,18 @@ def shamcash_check_bill(process_number, auth_token, access_token, forge_cookie, 
 
 
 def shamcash_pay_bill(bill_fields, auth_token, access_token, forge_cookie, service_id=37):
-    """دفع فاتورة مباشر بتشفير RSA+AES (بدون بروكسي)
-    bill_fields: [{key, value}, ...] - عادة [{"key":"process_number","value":"XXXX"}]
+    """دفع فاتورة - تشفير forge (encData فقط) - بدون بروكسي
+    bill_fields: [{key, value}, ...] - الحقول المرجعة من الاستعلام
     """
     import requests as req_lib
     if not HAS_CRYPTO:
         raise ImportError("مكتبة pycryptodome غير مثبتة!")
-    from Crypto.PublicKey import RSA
-    from Crypto.Cipher import PKCS1_v1_5
 
-    # 1. توليد مفتاح AES عشوائي
-    raw_key = os.urandom(16)
-    aes_key_b64 = base64.b64encode(raw_key).decode().replace('+', '-').replace('/', '_')
-
-    # 2. تشفير مفتاح AES بـ RSA
-    rsa_key = RSA.import_key(SHAMCASH_RSA_PUB_KEY)
-    rsa_cipher = PKCS1_v1_5.new(rsa_key)
-    encrypted_aes_key = base64.b64encode(rsa_cipher.encrypt(aes_key_b64.encode())).decode()
-
-    # 3. بناء payload الدفع
+    session_key = shamcash_get_session_key(forge_cookie)
     payload = {
-        "values": [{"key": f["key"], "value": f["value"]} for f in bill_fields],
-        "accessToken": access_token,
-        "SessionId": _get_session_id_from_jwt(auth_token)
+        "values": [{"key": f["key"], "value": f["value"]} for f in bill_fields]
     }
-    json_payload = json.dumps(payload, separators=(',', ':'))
-
-    # 4. تشفير الـ payload بـ AES-GCM
-    iv = os.urandom(12)
-    cipher = AES.new(raw_key, AES.MODE_GCM, nonce=iv)
-    cipher.update(b"")
-    ciphertext, tag = cipher.encrypt_and_digest(json_payload.encode('utf-8'))
-    enc_data = base64.b64encode(ciphertext + tag).decode() + "." + base64.b64encode(iv).decode()
-
-    # 5. إرسال الطلب
+    enc_data = shamcash_encrypt_payload(payload, session_key, access_token, auth_token)
     url = f"{SHAMCASH_PAYMENT_URL}/pay?serviceId={service_id}"
     headers = {
         "accept": "application/json",
@@ -299,11 +277,15 @@ def shamcash_pay_bill(bill_fields, auth_token, access_token, forge_cookie, servi
         "lang": "ar",
         "origin": "https://shamcash.sy",
         "referer": "https://shamcash.sy/ar/application/home",
-        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36"
     }
-    request_body = {"encData": enc_data, "aesKey": encrypted_aes_key}
-    response = req_lib.post(url, json=request_body, headers=headers, timeout=30)
-    return response.json()
+    response = req_lib.post(url, json={"encData": enc_data}, headers=headers, timeout=30)
+    if response.status_code != 200:
+        return {"succeeded": False, "message": f"HTTP {response.status_code}"}
+    try:
+        return response.json()
+    except:
+        return {"succeeded": False, "message": f"رد غير صالح: {response.text[:100]}"}
 
 
 def _get_session_id_from_jwt(auth_token):
@@ -1756,20 +1738,34 @@ class SessionCard(QGroupBox):
         threading.Thread(target=self._auto_pay_thread, args=(payment_code,), daemon=True).start()
 
     def _auto_pay_thread(self, payment_code):
-        """خيط الدفع التلقائي - ينتظر 10 ثوانٍ ثم يدفع مباشرة بدون استعلام، مع إعادة محاولة 3 مرات"""
+        """خيط الدفع التلقائي - ينتظر 10 ثوانٍ ثم يستعلم ويدفع، مع إعادة محاولة 3 مرات"""
         try:
             self.log(f"[*] [{self.session_id}] ⏳ انتظار 10 ثوانٍ قبل الدفع التلقائي للرمز: {payment_code}")
             time.sleep(10)
 
-            # دفع مباشر بدون استعلام - إرسال process_number فقط
-            bill_fields = [{"key": "process_number", "value": str(payment_code)}]
-
             max_retries = 3
             for attempt in range(1, max_retries + 1):
-                self.log(f"[*] [{self.session_id}] 💳 محاولة الدفع {attempt}/{max_retries}...")
+                self.log(f"[*] [{self.session_id}] 💳 محاولة {attempt}/{max_retries}: استعلام ثم دفع...")
                 try:
+                    # 1. استعلام للحصول على process_no و due_amount
+                    check_result = shamcash_check_bill(
+                        payment_code, self.shamcash_auth_token,
+                        self.shamcash_access_token, self.shamcash_forge_cookie)
+                    if not check_result.get("succeeded") or not check_result.get("data"):
+                        msg = check_result.get("message", "فشل الاستعلام")
+                        self.log(f"[-] [{self.session_id}] ❌ فشل الاستعلام (محاولة {attempt}): {msg}")
+                        if attempt < max_retries:
+                            time.sleep(5)
+                        continue
+
+                    # 2. استخراج الحقول الكاملة
+                    fields = check_result["data"][0]
+                    due_amount = next((item["value"] for item in fields if item["key"] == "due_amount"), None)
+                    self.log(f"[+] [{self.session_id}] ✅ استعلام ناجح: {due_amount} ل.س - جاري الدفع...")
+
+                    # 3. دفع بالحقول الكاملة
                     pay_result = shamcash_pay_bill(
-                        bill_fields, self.shamcash_auth_token,
+                        fields, self.shamcash_auth_token,
                         self.shamcash_access_token, self.shamcash_forge_cookie)
                     if pay_result.get("succeeded"):
                         self.log(f"[+] [{self.session_id}] 🎉🎉 تم الدفع التلقائي بنجاح! (محاولة {attempt})")
@@ -1779,23 +1775,22 @@ class SessionCard(QGroupBox):
                         tg = all_data.get("TELEGRAM_CONFIG", {})
                         if tg.get("token") and tg.get("chat_id"):
                             msg = (f"💳 <b>دفع تلقائي ناجح!</b>\n🚗 {self.session_id}\n"
+                                   f"💰 {due_amount} ل.س\n"
                                    f"🔢 الرمز: <code>{payment_code}</code>\n"
                                    f"🔄 المحاولة: {attempt}/{max_retries}")
                             threading.Thread(target=send_telegram_message,
                                            args=(tg["token"], tg["chat_id"], msg), daemon=True).start()
-                        return  # نجاح - نخرج
+                        return  # نجاح
                     else:
                         msg = pay_result.get("message", "خطأ")
                         self.log(f"[-] [{self.session_id}] ❌ فشل الدفع (محاولة {attempt}): {msg}")
                 except Exception as e:
                     self.log(f"[!] [{self.session_id}] ❌ خطأ في المحاولة {attempt}: {e}")
 
-                # إعادة محاولة بعد 5 ثوانٍ إن لم تكن المحاولة الأخيرة
                 if attempt < max_retries:
                     self.log(f"[*] [{self.session_id}] ⏳ إعادة المحاولة بعد 5 ثوانٍ...")
                     time.sleep(5)
 
-            # فشلت كل المحاولات
             self.log(f"[!] [{self.session_id}] ❌ فشلت كل محاولات الدفع التلقائي ({max_retries} محاولات)")
             self._ui_status_signal.emit("❌ فشل الدفع التلقائي", "#da3633")
         except Exception as e:
@@ -2214,7 +2209,7 @@ class SarmadaPro(QMainWindow):
         worker.start()
 
     def _shamcash_pay(self, card):
-        """دفع شام كاش مباشر بدون استعلام"""
+        """دفع شام كاش: استعلام + دفع تلقائي بضغطة واحدة"""
         ui = card._shamcash_ui
         code = ui['inp_code'].text().strip()
         if not code:
@@ -2223,20 +2218,53 @@ class SarmadaPro(QMainWindow):
         if not card.shamcash_auth_token:
             QMessageBox.warning(self, "تنبيه", "سحب توكنات شام كاش أولاً!")
             return
-        # دفع مباشر - إرسال process_number فقط بدون استعلام
-        bill_fields = [{"key": "process_number", "value": str(code)}]
+        if not card.shamcash_forge_cookie:
+            QMessageBox.warning(self, "تنبيه", "لا يوجد forge cookie! سحب التوكنات أولاً.")
+            return
         ui['btn_pay'].setEnabled(False)
         ui['btn_pay'].setText("⏳...")
-        ui['lbl_result'].setText("⏳ جاري الدفع المباشر...")
-        worker = ShamCashWorker("pay", card.session_id,
-                                card.shamcash_auth_token, card.shamcash_access_token,
-                                card.shamcash_forge_cookie,
-                                bill_fields=bill_fields)
-        worker.log_signal.connect(self.print_log)
-        worker.result_signal.connect(lambda data, op: self._shamcash_on_result(card, data, op))
-        worker.finished.connect(lambda: self._shamcash_reset_btn(ui['btn_pay'], "💰 دفع مباشر"))
-        card._shamcash_pay_worker = worker
-        worker.start()
+        ui['lbl_result'].setText("⏳ جاري الاستعلام والدفع...")
+        # تشغيل في خيط مستقل
+        threading.Thread(target=self._shamcash_pay_thread, args=(card, code), daemon=True).start()
+
+    def _shamcash_pay_thread(self, card, code):
+        """خيط الدفع اليدوي: استعلام ثم دفع"""
+        ui = card._shamcash_ui
+        try:
+            # 1. استعلام
+            check_result = shamcash_check_bill(
+                code, card.shamcash_auth_token,
+                card.shamcash_access_token, card.shamcash_forge_cookie)
+            if not check_result.get("succeeded") or not check_result.get("data"):
+                msg = check_result.get("message", "فشل الاستعلام")
+                ui['lbl_result'].setText(f"❌ {msg}")
+                ui['lbl_result'].setStyleSheet("color: #da3633; font-size: 11px;")
+                ui['btn_pay'].setEnabled(True)
+                ui['btn_pay'].setText("💰 دفع مباشر")
+                return
+
+            fields = check_result["data"][0]
+            due_amount = next((item["value"] for item in fields if item["key"] == "due_amount"), "?")
+            ui['lbl_result'].setText(f"✅ {due_amount} ل.س - جاري الدفع...")
+
+            # 2. دفع
+            pay_result = shamcash_pay_bill(
+                fields, card.shamcash_auth_token,
+                card.shamcash_access_token, card.shamcash_forge_cookie)
+            if pay_result.get("succeeded"):
+                ui['lbl_result'].setText(f"🎉 تم الدفع! ({due_amount} ل.س)")
+                ui['lbl_result'].setStyleSheet("color: #238636; font-size: 13px;")
+                self.print_log(f"[+] [{card.session_id}] 🎉 دفع يدوي ناجح: {due_amount} ل.س")
+            else:
+                msg = pay_result.get("message", "خطأ")
+                ui['lbl_result'].setText(f"❌ فشل: {msg}")
+                ui['lbl_result'].setStyleSheet("color: #da3633; font-size: 11px;")
+        except Exception as e:
+            ui['lbl_result'].setText(f"❌ خطأ: {str(e)[:50]}")
+            ui['lbl_result'].setStyleSheet("color: #da3633; font-size: 11px;")
+        finally:
+            ui['btn_pay'].setEnabled(True)
+            ui['btn_pay'].setText("💰 دفع مباشر")
 
     def _shamcash_on_result(self, card, data, op_type):
         ui = card._shamcash_ui
