@@ -1235,8 +1235,13 @@ class SessionCard(QGroupBox):
                 return False
 
     def recover_browser(self):
-        """إصلاح المتصفح المتعطل - إغلاق + حذف الكاش + إعادة فتح"""
+        """إصلاح المتصفح المتعطل - إغلاق + حذف الكاش + إعادة فتح (بخيط مستقل)"""
         self.log(f"[*] [{self.session_id}] 🔧 جاري إصلاح المتصفح المتعطل...")
+        self.update_status("🔧 جاري الإصلاح...", "#e3b341")
+        threading.Thread(target=self._recover_thread, daemon=True).start()
+
+    def _recover_thread(self):
+        """خيط الإصلاح - لا يجمّد الواجهة"""
         with self.driver_lock:
             if self.driver:
                 try:
@@ -1244,7 +1249,7 @@ class SessionCard(QGroupBox):
                 except:
                     pass
                 self.driver = None
-        # حذف الكاش مع المحافظة على البيانات المهمة
+        # حذف الكاش
         self.clean_browser_cache()
         self._ui_browser_btn_signal.emit("🌐 فتح المتصفح", True)
         self.update_status("إعادة تشغيل المتصفح...", "#e3b341")
@@ -1252,52 +1257,45 @@ class SessionCard(QGroupBox):
         self.launch_browser()
 
     def clean_browser_cache(self):
-        """حذف كاش المتصفح (2+ غيغا) مع المحافظة على توكنات Google وشام كاش"""
+        """حذف كاش المتصفح بسرعة - بدون حساب الحجم (لا يجمّد)"""
         profile_dir = os.path.join(os.getcwd(), "Profiles", f"Profile_{self.session_id}")
         if not os.path.exists(profile_dir):
             return
-        # المجلدات والملفات الثقيلة التي يجب حذفها
+        # المجلدات الثقيلة التي يجب حذفها
         dirs_to_delete = [
             "Cache", "Code Cache", "GPUCache", "DawnCache",
             "ShaderCache", "GrShaderCache", "Service Worker",
             "blob_storage", "IndexedDB", "File System",
             "optimization_guide_prediction_model_downloads",
-            "BrowserMetrics", "crash_count", "heavy_ad_intervention",
+            "BrowserMetrics", "heavy_ad_intervention",
+            "component_crx_cache", "PepperFlash", "pnacl",
+            "Safe Browsing", "Crashpad",
         ]
         files_to_delete = [
             "Visited Links", "History", "History-journal",
             "Top Sites", "Top Sites-journal", "Favicons", "Favicons-journal",
             "Network Action Predictor", "TransportSecurity",
         ]
-        # الملفات المهمة التي يجب المحافظة عليها
-        # Cookies, Login Data, Local State, Preferences, Web Data, bookmarks
-        deleted_size = 0
+        count = 0
         for d_name in dirs_to_delete:
-            # البحث في المجلد الرئيسي و Default
             for base in [profile_dir, os.path.join(profile_dir, "Default")]:
                 d_path = os.path.join(base, d_name)
-                if os.path.exists(d_path) and os.path.isdir(d_path):
+                if os.path.exists(d_path):
                     try:
-                        size = sum(
-                            os.path.getsize(os.path.join(dp, f))
-                            for dp, dn, fnames in os.walk(d_path)
-                            for f in fnames
-                        )
                         shutil.rmtree(d_path, ignore_errors=True)
-                        deleted_size += size
+                        count += 1
                     except:
                         pass
         for f_name in files_to_delete:
             for base in [profile_dir, os.path.join(profile_dir, "Default")]:
                 f_path = os.path.join(base, f_name)
-                if os.path.exists(f_path) and os.path.isfile(f_path):
+                if os.path.isfile(f_path):
                     try:
-                        deleted_size += os.path.getsize(f_path)
                         os.remove(f_path)
+                        count += 1
                     except:
                         pass
-        mb = deleted_size / (1024 * 1024)
-        self.log(f"[+] [{self.session_id}] 🧹 تم حذف {mb:.1f} MB من الكاش.")
+        self.log(f"[+] [{self.session_id}] 🧹 تم حذف {count} عنصر من الكاش.")
 
     def inject_shamcash_cookies(self):
         """حقن توكنات شام كاش المحفوظة في المتصفح لاستعادة الجلسة"""
@@ -2273,14 +2271,17 @@ class SarmadaPro(QMainWindow):
         QMessageBox.information(self, "استيراد", f"{msg}\nتم تحديث {updated} جلسة.")
 
     def _repair_clean_all_cache(self):
-        """حذف كاش كل مجلدات المتصفحات"""
-        total_cleaned = 0
+        """حذف كاش كل مجلدات المتصفحات (بخيط مستقل)"""
+        self.print_log("[*] 🧹 جاري حذف كاش كل الجلسات...")
+        threading.Thread(target=self._clean_all_thread, daemon=True).start()
+
+    def _clean_all_thread(self):
+        """خيط حذف كاش الكل"""
+        total = 0
         for card in self.sessions:
             card.clean_browser_cache()
-            total_cleaned += 1
-        self.print_log(f"[+] 🧹 تم تنظيف كاش {total_cleaned} جلسة.")
-        QMessageBox.information(self, "تنظيف", f"تم حذف كاش {total_cleaned} جلسة.\nيجب إعادة فتح المتصفحات.")
-        self._populate_repair_tab()
+            total += 1
+        self.print_log(f"[+] 🧹 تم تنظيف كاش {total} جلسة.")
 
     def _repair_inject_all(self):
         """حقن توكنات شام كاش في كل المتصفحات المفتوحة"""
@@ -2295,7 +2296,7 @@ class SarmadaPro(QMainWindow):
             QMessageBox.warning(self, "حقن", "لا متصفحات مفتوحة أو لا توكنات محفوظة.")
 
     def _populate_repair_tab(self):
-        """ملء تبويب الإصلاح بمعلومات الجلسات"""
+        """ملء تبويب الإصلاح بمعلومات الجلسات (خفيف بدون حساب حجم)"""
         # تنظيف القائمة
         while self.repair_list_layout.count():
             item = self.repair_list_layout.takeAt(0)
@@ -2312,26 +2313,27 @@ class SarmadaPro(QMainWindow):
         for card in self.sessions:
             row = QHBoxLayout()
             profile_path = os.path.join(profiles_dir, f"Profile_{card.session_id}")
-            # حساب حجم المجلد
-            size_mb = 0
-            if os.path.exists(profile_path):
-                try:
-                    for dp, dn, fnames in os.walk(profile_path):
-                        for f in fnames:
-                            fp = os.path.join(dp, f)
-                            if os.path.exists(fp):
-                                size_mb += os.path.getsize(fp)
-                except:
-                    pass
-            size_mb = size_mb / (1024 * 1024)
-            color = "#da3633" if size_mb > 500 else "#e3b341" if size_mb > 100 else "#238636"
-            lbl = QLabel(f"📂 {card.session_id} | {size_mb:.0f} MB")
-            lbl.setStyleSheet(f"color: {color}; font-weight: bold;")
-            row.addWidget(lbl, 3)
+            exists = os.path.exists(profile_path)
             # حالة المتصفح
-            alive = "🟢" if card.driver and card.is_browser_alive() else "🔴" if card.driver else "⚪"
+            if card.driver and card.is_browser_alive():
+                alive = "🟢 يعمل"
+                alive_color = "#238636"
+            elif card.driver:
+                alive = "🔴 متعطل"
+                alive_color = "#da3633"
+            else:
+                alive = "⚪ مغلق"
+                alive_color = "#8b949e"
+
+            lbl = QLabel(f"📂 {card.session_id}")
+            lbl.setStyleSheet("color: #58a6ff; font-weight: bold;")
+            row.addWidget(lbl, 2)
             lbl_st = QLabel(alive)
+            lbl_st.setStyleSheet(f"color: {alive_color}; font-weight: bold;")
             row.addWidget(lbl_st, 1)
+            lbl_folder = QLabel("✅ موجود" if exists else "❌ غير موجود")
+            lbl_folder.setStyleSheet(f"color: {'#238636' if exists else '#da3633'}; font-size: 11px;")
+            row.addWidget(lbl_folder, 1)
             btn_clean = QPushButton("🧹 حذف كاش")
             btn_clean.setStyleSheet("background-color: #da3633; color: white;")
             btn_clean.clicked.connect(lambda ch, c=card: self._repair_clean_one(c))
@@ -2349,9 +2351,8 @@ class SarmadaPro(QMainWindow):
             self.repair_list_layout.addWidget(container)
 
     def _repair_clean_one(self, card):
-        """حذف كاش جلسة واحدة"""
-        card.clean_browser_cache()
-        self._populate_repair_tab()
+        """حذف كاش جلسة واحدة (بخيط مستقل)"""
+        threading.Thread(target=card.clean_browser_cache, daemon=True).start()
 
     def _on_tab_changed(self, index):
         """عند تبديل التبويب - تحديث المحتوى"""
